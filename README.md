@@ -1,4 +1,3 @@
-# taranveer-singh.github.io
 # Taranveer Singh – Project Portfolio
 
 Welcome to my project portfolio! I am a Computer Science student passionate about automation, IoT, and cloud systems. Here are some of my featured projects:
