@@ -2,7 +2,7 @@ import requests
 import json
 import time
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
@@ -53,6 +53,24 @@ def find_alerts(current_data, previous_data):
 
     return alerts
 
+def was_recently_alerted(alert, history, window_minutes=60):
+    now = datetime.now(timezone.utc)
+    for past_alert in history:
+        if (
+            past_alert["event"] == alert["event"] and
+            past_alert["bin"] == alert["bin"] and
+            past_alert["field"] == alert["field"] and
+            abs(past_alert["new"] - alert["new"]) < 1e-2  # Optional: filter identical values
+        ):
+            # Check if timestamp is recent
+            try:
+                past_time = datetime.fromisoformat(past_alert["timestamp"])
+                if (now - past_time).total_seconds() < window_minutes * 60:
+                    return True
+            except Exception:
+                continue
+    return False
+
 def send_discord_alert(alerts):
     if not alerts:
         return
@@ -72,21 +90,13 @@ def log_alerts_to_file(alerts, path="alerts_history.json"):
     if not alerts:
         return
 
-    # Ensure file is a dict, not a list
-    if os.path.exists(path):
-        with open(path, "r") as f:
-            try:
-                existing = json.load(f)
-                if not isinstance(existing, dict):
-                    existing = {}
-            except json.JSONDecodeError:
-                existing = {}
-    else:
-        existing = {}
+    existing = load_alert_history(path)
 
-    # Add new alerts with timestamp
-    timestamp = datetime.now(datetime.UTC).isoformat()
-    existing[timestamp] = alerts
+    # Add timestamp to each alert and append to list
+    timestamp = datetime.now(timezone.utc).isoformat()
+    for alert in alerts:
+        alert["timestamp"] = timestamp
+        existing.append(alert)
 
     with open(path, "w") as f:
         json.dump(existing, f, indent=2)
@@ -103,10 +113,18 @@ def save_alert_history(path, history):
 def load_alert_history(path):
     if not os.path.exists(path):
         return []
+
     with open(path, 'r') as f:
-        return json.load(f)
+        data = json.load(f)
 
+    # Flatten dictionary-of-lists into a flat list
+    if isinstance(data, dict):
+        all_alerts = []
+        for alert_list in data.values():
+            all_alerts.extend(alert_list)
+        return all_alerts
 
+    return data  # Already flat
 
 
 
@@ -203,16 +221,16 @@ if __name__ == "__main__":
 
     alerts = find_alerts(current_data, previous_data)
 
-    if alerts:
-        send_discord_alert(alerts)
-        if alerts:
-            history = load_alert_history("alerts_history.json")
-            timestamp = datetime.now(timezone.utc).isoformat()
-            for alert in alerts:
-                alert["timestamp"] = timestamp
-                history.append(alert)
-            save_alert_history("alerts_history.json", history)
-        log_alerts_to_file(alerts)
+    history = load_alert_history("alerts_history.json")
+    filtered_alerts = [a for a in alerts if not was_recently_alerted(a, history)]
+
+    if filtered_alerts:
+        send_discord_alert(filtered_alerts)
+        log_alerts_to_file(filtered_alerts)
 
     save_json("previous_data.json", current_data)
+    print("📝 previous_data.json updated.")
+
+ 
+    print("⏱️ Script started at:", datetime.now(timezone.utc).isoformat())
 
