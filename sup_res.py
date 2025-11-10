@@ -1,178 +1,220 @@
-import pandas as pd
-import yfinance as yf
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+#!/usr/bin/env python3
+import argparse
+import sys
 import time
-from datetime import datetime
-import os
-from typing import List, Dict
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional
 
-# ------------------------------------------------------------------
-# CONFIG – CHANGE THESE IF NEEDED
-# ------------------------------------------------------------------
-CSV_FILE = "nasdaq_2_to_10_stocks_fresh.csv"   # <-- NEW CSV FROM ME
-PROXIMITY_THRESHOLD = 0.02               # 2% proximity to ATH/ATL
-CHECK_INTERVAL = 300                     # 5 minutes
-EMAIL_ENABLED = False                    # Set to True + fill creds below
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
 
-# Email (optional – leave empty if EMAIL_ENABLED=False)
-SMTP_SERVER = "smtp.gmail.com"
-SMTP_PORT = 587
-SENDER_EMAIL = ""          # e.g. "you@gmail.com"
-SENDER_PASSWORD = ""       # App password, NOT login password
-RECIPIENT_EMAIL = ""       # e.g. "you@gmail.com"
+import yfinance as yf
+import pandas as pd
 
-# ------------------------------------------------------------------
-class SupportResistanceBot:
-    def __init__(self):
-        self.csv_file = CSV_FILE
-        self.proximity = PROXIMITY_THRESHOLD
-        self.interval = CHECK_INTERVAL
-        self.email_enabled = EMAIL_ENABLED
-        self.smtp_server = SMTP_SERVER
-        self.smtp_port = SMTP_PORT
-        self.sender = SENDER_EMAIL
-        self.password = SENDER_PASSWORD
-        self.recipient = RECIPIENT_EMAIL
+# ------------------- CONFIG -------------------
+ALERT_PCT = 0.005         # 0.5% proximity (was 0.02)
+POLL_SECS = 300           # 5 min
+LOOKBACK_LOCAL = 5        # 1-week
+LOOKBACK_52W = 252        # 52-week
+LOOKBACK_30D = 30         # Monthly
+MIN_VOLUME_PER_MIN = 50000
+PRICE_LO = 2.0
+PRICE_HI = 50.0
+CSV_FILE = "nasdaq_2_to_50_stocks.csv"
+# ---------------------------------------------
 
-        self.symbols = self.load_symbols()
-        self.alerted = set()  # Prevent spam
+# ---------- Load CSV ----------
+def load_universe() -> List[str]:
+    try:
+        df = pd.read_csv(CSV_FILE)
+        symbols = df['symbol'].dropna().str.strip().str.upper().unique().tolist()
+        print(f"Loaded {len(symbols)} symbols from {CSV_FILE}")
+        return symbols
+    except Exception as e:
+        print(f"CSV error: {e}")
+        sys.exit(1)
 
-    def load_symbols(self) -> List[str]:
-        """Load only the 'symbol' column from the CSV I provided."""
+# ---------- Data ----------
+def fetch_daily(tickers: List[str]) -> Dict[str, pd.DataFrame]:
+    data = {}
+    for t in tickers:
         try:
-            df = pd.read_csv(self.csv_file)
-            symbols = df['symbol'].dropna().str.strip().tolist()
-            print(f"Loaded {len(symbols)} symbols from {self.csv_file}")
-            return symbols
-        except Exception as e:
-            print(f"Failed to load CSV: {e}")
-            return []
-
-    def get_hist(self, symbol: str, period: str = "2y") -> pd.DataFrame:
-        try:
-            return yf.Ticker(symbol).history(period=period, auto_adjust=True)
+            df = yf.download(t, period="2y", interval="1d", auto_adjust=True, progress=False)
+            if not df.empty:
+                data[t] = df
         except:
-            return pd.DataFrame()
+            pass
+    return data
 
-    def calc_levels(self, hist: pd.DataFrame) -> Dict:
-        if hist.empty:
-            return {}
-        ath = hist['High'].max()
-        atl = hist['Low'].min()
-        cur = hist['Close'].iloc[-1]
-        return {
-            'ath': ath,
-            'atl': atl,
-            'current': cur,
-            'ath_pct': abs(cur - ath) / ath,
-            'atl_pct': abs(cur - atl) / atl
-        }
+def fetch_intraday(tickers: List[str]) -> Dict[str, pd.DataFrame]:
+    data = {}
+    for t in tickers:
+        try:
+            df = yf.download(t, period="5d", interval="5m", auto_adjust=True, progress=False)
+            if not df.empty:
+                data[t] = df
+        except:
+            pass
+    return data
 
-    def check_alert(self, symbol: str, levels: Dict) -> Dict | None:
-        if symbol in self.alerted:
-            return None
-
-        cur = levels['current']
-        if levels['ath_pct'] <= self.proximity:
-            self.alerted.add(symbol)
-            return {
-                'symbol': symbol,
-                'type': 'ATH',
-                'current': cur,
-                'target': levels['ath'],
-                'pct': levels['ath_pct'] * 100
-            }
-        if levels['atl_pct'] <= self.proximity:
-            self.alerted.add(symbol)
-            return {
-                'symbol': symbol,
-                'type': 'ATL',
-                'current': cur,
-                'target': levels['atl'],
-                'pct': levels['atl_pct'] * 100
-            }
+# ---------- Levels ----------
+def last_close(df: pd.DataFrame) -> Optional[float]:
+    try:
+        return float(df["Close"].iloc[-1])
+    except:
         return None
 
-    def send_email(self, alert: Dict):
-        if not self.email_enabled:
-            return
-        msg = MIMEMultipart()
-        msg['From'] = self.sender
-        msg['To'] = self.recipient
-        msg['Subject'] = f"{alert['type']} ALERT: {alert['symbol']}"
+def prior_local_hi_lo(df: pd.DataFrame):
+    if len(df) <= LOOKBACK_LOCAL:
+        return None, None
+    window = df.iloc[-(LOOKBACK_LOCAL+1):-1]
+    return float(window["High"].max()), float(window["Low"].min())
 
-        body = f"""
-{alert['type']} APPROACH ALERT
+def hi_lo_52w(df: pd.DataFrame):
+    window = df.iloc[-LOOKBACK_52W:] if len(df) >= LOOKBACK_52W else df
+    return float(window["High"].max()), float(window["Low"].min())
 
-Symbol     : {alert['symbol']}
-Current    : ${alert['current']:.2f}
-Target     : ${alert['target']:.2f}
-Proximity  : {alert['pct']:.2f}%
+def hi_lo_30d(df: pd.DataFrame):
+    cutoff = datetime.now() - timedelta(days=LOOKBACK_30D)
+    recent = df[df.index >= cutoff]
+    if recent.empty:
+        return None, None
+    return float(recent["High"].max()), float(recent["Low"].min())
 
-Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-"""
-        msg.attach(MIMEText(body, 'plain'))
+def today_yesterday_hilo(df_intra: pd.DataFrame):
+    if df_intra is None or df_intra.empty:
+        return None, None, None, None
+    df = df_intra.copy()
+    df["date"] = df.index.date
+    groups = df.groupby("date")
+    dates = sorted(groups.groups.keys())
+    if len(dates) < 1:
+        return None, None, None, None
+    today = groups.get_group(dates[-1])
+    yday = groups.get_group(dates[-2]) if len(dates) >= 2 else None
+    t_hi = float(today["High"].max()) if not today.empty else None
+    t_lo = float(today["Low"].min()) if not today.empty else None
+    y_hi = float(yday["High"].max()) if yday is not None and not yday.empty else None
+    y_lo = float(yday["Low"].min()) if yday is not None and not yday.empty else None
+    return t_hi, t_lo, y_hi, y_lo
 
-        try:
-            server = smtplib.SMTP(self.smtp_server, self.smtp_port)
-            server.starttls()
-            server.login(self.sender, self.password)
-            server.sendmail(self.sender, self.recipient, msg.as_string())
-            server.quit()
-            print(f"Email sent for {alert['symbol']}")
-        except Exception as e:
-            print(f"Email failed: {e}")
+def estimate_vol_per_min(df_intra: pd.DataFrame) -> Optional[float]:
+    if df_intra is None or df_intra.empty or "Volume" not in df_intra.columns:
+        return None
+    df = df_intra.copy()
+    df["date"] = df.index.date
+    today = df[df["date"] == df["date"].max()]
+    if today.empty:
+        return None
+    tail = today.tail(3)
+    total = float(tail["Volume"].sum())
+    mins = 5.0 * max(len(tail), 1)
+    return total / mins if total > 0 else None
 
-    def scan_once(self) -> List[Dict]:
-        alerts = []
-        print(f"\nScanning {len(self.symbols)} symbols (2% proximity)...")
-        for i, sym in enumerate(self.symbols, 1):
-            hist = self.get_hist(sym)
-            levels = self.calc_levels(hist)
-            if not levels:
-                continue
-            alert = self.check_alert(sym, levels)
-            if alert:
-                alerts.append(alert)
-                print(f"ALERT: {sym} → {alert['type']} (${alert['current']:.2f})")
-                self.send_email(alert)
-            if i % 10 == 0:
-                print(f"  → {i}/{len(self.symbols)} processed")
-        return alerts
+# ---------- Filter $2–$50 ----------
+def screen_price_band(daily_data: Dict[str, pd.DataFrame]) -> List[str]:
+    return [t for t, df in daily_data.items() if (p := last_close(df)) and PRICE_LO <= p <= PRICE_HI]
 
-    def run_forever(self):
-        print(f"Starting continuous monitoring every {self.interval}s")
-        print("-" * 50)
-        while True:
-            try:
-                alerts = self.scan_once()
-                if alerts:
-                    print(f"\n{len(alerts)} new alert(s):")
-                    for a in alerts:
-                        print(f"  • {a['symbol']}: {a['type']} (${a['current']:.2f})")
-                print(f"\nNext scan in {self.interval}s... (Ctrl+C to stop)")
-                time.sleep(self.interval)
-            except KeyboardInterrupt:
-                print("\nStopping bot...")
-                break
-            except Exception as e:
-                print(f"Error: {e}")
-                time.sleep(60)
+# ---------- Alerts (Only Real, 0.5% Proximity) ----------
+def analyze_ticker(t: str, df_daily: pd.DataFrame, df_intra: Optional[pd.DataFrame]):
+    p = last_close(df_daily)
+    if not p or PRICE_LO > p or p > PRICE_HI:
+        return []
 
-# ------------------------------------------------------------------
+    # Volume gate — silently skip
+    vpm = estimate_vol_per_min(df_intra)
+    if vpm is not None and vpm < MIN_VOLUME_PER_MIN:
+        return []
+
+    now = datetime.now().strftime("%H:%M")
+    msgs = []
+
+    # 1-Week
+    loc_hi, loc_lo = prior_local_hi_lo(df_daily)
+    if loc_hi and p > loc_hi:
+        msgs.append(f"[{now}] {t}: Broke 1W HIGH → ${p:,.2f}")
+    elif loc_hi and abs(p - loc_hi) / loc_hi <= ALERT_PCT:
+        msgs.append(f"[{now}] {t}: Near 1W HIGH → ${p:,.2f}")
+
+    if loc_lo and p < loc_lo:
+        msgs.append(f"[{now}] {t}: Broke 1W LOW → ${p:,.2f}")
+    elif loc_lo and abs(p - loc_lo) / loc_lo <= ALERT_PCT:
+        msgs.append(f"[{now}] {t}: Near 1W LOW → ${p:,.2f}")
+
+    # 52-Week
+    yr_hi, yr_lo = hi_lo_52w(df_daily)
+    if yr_hi and p > yr_hi:
+        msgs.append(f"[{now}] {t}: New 52W HIGH → ${p:,.2f}")
+    elif yr_hi and abs(p - yr_hi) / yr_hi <= ALERT_PCT:
+        msgs.append(f"[{now}] {t}: Near 52W HIGH → ${p:,.2f}")
+
+    if yr_lo and p < yr_lo:
+        msgs.append(f"[{now}] {t}: New 52W LOW → ${p:,.2f}")
+    elif yr_lo and abs(p - yr_lo) / yr_lo <= ALERT_PCT:
+        msgs.append(f"[{now}] {t}: Near 52W LOW → ${p:,.2f}")
+
+    # Monthly
+    mon_hi, mon_lo = hi_lo_30d(df_daily)
+    if mon_hi and p > mon_hi:
+        msgs.append(f"[{now}] {t}: New MONTHLY HIGH → ${p:,.2f}")
+    elif mon_hi and abs(p - mon_hi) / mon_hi <= ALERT_PCT:
+        msgs.append(f"[{now}] {t}: Near MONTHLY HIGH → ${p:,.2f}")
+
+    if mon_lo and p < mon_lo:
+        msgs.append(f"[{now}] {t}: New MONTHLY LOW → ${p:,.2f}")
+    elif mon_lo and abs(p - mon_lo) / mon_lo <= ALERT_PCT:
+        msgs.append(f"[{now}] {t}: Near MONTHLY LOW → ${p:,.2f}")
+
+    # Today/Yesterday
+    if df_intra is not None:
+        t_hi, t_lo, y_hi, y_lo = today_yesterday_hilo(df_intra)
+        if t_hi and p > t_hi:
+            msgs.append(f"[{now}] {t}: Took out TODAY high")
+        if t_lo and p < t_lo:
+            msgs.append(f"[{now}] {t}: Broke TODAY low")
+        if y_hi and p > y_hi:
+            msgs.append(f"[{now}] {t}: Cleared YESTERDAY high")
+        if y_lo and p < y_lo:
+            msgs.append(f"[{now}] {t}: Lost YESTERDAY low")
+
+    return msgs
+
+# ---------- Main Loop ----------
+def run_watch():
+    seen = set()
+    while True:
+        tickers = load_universe()
+        daily = fetch_daily(tickers)
+        band = screen_price_band(daily)
+        intra = fetch_intraday(band)
+
+        header = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"\n[{header}] Scanning {len(band)} stocks in ${PRICE_LO}–${PRICE_HI} (0.5% proximity)...")
+
+        new_alerts = False
+        for t in band:
+            msgs = analyze_ticker(t, daily[t], intra.get(t))
+            for m in msgs:
+                if m not in seen:
+                    print(m)
+                    seen.add(m)
+                    new_alerts = True
+
+        if not new_alerts:
+            print("  No new alerts.")
+
+        print(f"Next scan in {POLL_SECS // 60} min...")
+        time.sleep(POLL_SECS)
+
+# ---------- CLI ----------
 def main():
-    bot = SupportResistanceBot()
-    if not bot.symbols:
-        print("No symbols loaded. Save the CSV as 'nasdaq_2_to_10_stocks.csv'")
-        return
-
-    mode = input("Run once (o) or continuous (c)? [o/c]: ").strip().lower()
-    if mode == 'c':
-        bot.run_forever()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--watch", action="store_true")
+    args = parser.parse_args()
+    if args.watch:
+        run_watch()
     else:
-        bot.scan_once()
+        print("Use --watch to run.")
 
 if __name__ == "__main__":
     main()
