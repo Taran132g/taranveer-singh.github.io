@@ -3,7 +3,8 @@ import argparse
 import sys
 import time
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -17,9 +18,9 @@ POLL_SECS = 300           # 5 min
 LOOKBACK_LOCAL = 5        # 1-week
 LOOKBACK_52W = 252        # 52-week
 LOOKBACK_30D = 30         # Monthly
-MIN_VOLUME_PER_MIN = 50000
-PRICE_LO = 2.0
-PRICE_HI = 50.0
+MIN_VOLUME_PER_MIN = 100000
+PRICE_LO = 5.0
+PRICE_HI = 30.0
 CSV_FILE = "nasdaq_2_to_50_stocks.csv"
 # ---------------------------------------------
 
@@ -179,42 +180,108 @@ def analyze_ticker(t: str, df_daily: pd.DataFrame, df_intra: Optional[pd.DataFra
 
     return msgs
 
+def write_alert_file(path: str, generated_at: datetime, symbols: Sequence[str], history: Sequence[str]) -> None:
+    """Persist the current alert snapshot to ``path``."""
+
+    output_path = Path(path).expanduser()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = generated_at.strftime("%Y-%m-%d %H:%M:%S")
+    unique_symbols = sorted({s.strip().upper() for s in symbols if s})
+
+    with output_path.open("w", encoding="utf-8") as fh:
+        fh.write(f"# Alerts generated at {timestamp}\n")
+        fh.write("TICKERS: ")
+        fh.write(",".join(unique_symbols))
+        fh.write("\n\n")
+
+        if history:
+            for line in history:
+                fh.write(f"{line}\n")
+        else:
+            fh.write("No alerts yet.\n")
+
+
+def scan_once(seen: Optional[Set[str]] = None) -> Tuple[str, int, List[str], Set[str]]:
+    """Run a single scan and return the header, coverage size, new messages, and symbols."""
+
+    tickers = load_universe()
+    daily = fetch_daily(tickers)
+    band = screen_price_band(daily)
+    intra = fetch_intraday(band)
+
+    header = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    seen_cache = seen if seen is not None else set()
+    new_msgs: List[str] = []
+    triggered: Set[str] = set()
+
+    for t in band:
+        df_daily = daily.get(t)
+        if df_daily is None:
+            continue
+        msgs = analyze_ticker(t, df_daily, intra.get(t))
+        for msg in msgs:
+            if msg in seen_cache:
+                continue
+            new_msgs.append(msg)
+            triggered.add(t)
+            seen_cache.add(msg)
+
+    return header, len(band), new_msgs, triggered
+
+
 # ---------- Main Loop ----------
-def run_watch():
-    seen = set()
+def run_once(output_path: Optional[str] = None) -> None:
+    header, coverage, messages, symbols = scan_once()
+    print(f"\n[{header}] Scanning {coverage} stocks in ${PRICE_LO}–${PRICE_HI} (0.5% proximity)...")
+
+    if messages:
+        for msg in messages:
+            print(msg)
+    else:
+        print("  No alerts.")
+
+    if output_path:
+        write_alert_file(output_path, datetime.now(), list(symbols), list(messages))
+
+
+def run_watch(output_path: Optional[str] = None) -> None:
+    seen: Set[str] = set()
+    history: List[str] = []
+    active_symbols: Set[str] = set()
+
     while True:
-        tickers = load_universe()
-        daily = fetch_daily(tickers)
-        band = screen_price_band(daily)
-        intra = fetch_intraday(band)
+        header, coverage, messages, new_symbols = scan_once(seen)
+        print(f"\n[{header}] Scanning {coverage} stocks in ${PRICE_LO}–${PRICE_HI} (0.5% proximity)...")
 
-        header = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"\n[{header}] Scanning {len(band)} stocks in ${PRICE_LO}–${PRICE_HI} (0.5% proximity)...")
-
-        new_alerts = False
-        for t in band:
-            msgs = analyze_ticker(t, daily[t], intra.get(t))
-            for m in msgs:
-                if m not in seen:
-                    print(m)
-                    seen.add(m)
-                    new_alerts = True
-
-        if not new_alerts:
+        if messages:
+            for msg in messages:
+                print(msg)
+            history.extend(messages)
+            active_symbols.update(new_symbols)
+        else:
             print("  No new alerts.")
+
+        if output_path:
+            write_alert_file(output_path, datetime.now(), list(active_symbols), list(history))
 
         print(f"Next scan in {POLL_SECS // 60} min...")
         time.sleep(POLL_SECS)
 
+
 # ---------- CLI ----------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--watch", action="store_true")
+    parser.add_argument("--watch", action="store_true", help="Continuously poll for support/resistance alerts.")
+    parser.add_argument("--once", action="store_true", help="Run a single scan and exit.")
+    parser.add_argument("--output", type=str, help="Write alerts and watchlist symbols to the provided file path.")
     args = parser.parse_args()
-    if args.watch:
-        run_watch()
+
+    if args.once:
+        run_once(args.output)
+    elif args.watch:
+        run_watch(args.output)
     else:
-        print("Use --watch to run.")
+        print("Use --watch for continuous monitoring or --once for a single scan.")
 
 if __name__ == "__main__":
     main()
