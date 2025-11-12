@@ -215,10 +215,9 @@ with logbook_col:
     if logbook_df.empty:
         st.info("No alerts logged yet.")
     else:
-        cols_to_show = [c for c in ["timestamp", "symbol", "direction", "price", "ratio", "total_bids", "total_asks", "heavy_venues"] if c in logbook_df.columns]
+        cols_to_show = [c for c in ["timestamp", "symbol", "direction", "price", "total_bids", "total_asks", "heavy_venues"] if c in logbook_df.columns]
         logbook_df_display = logbook_df[cols_to_show].copy()
         logbook_df_display["price"] = logbook_df_display["price"].apply(lambda x: f"${x:.3f}" if pd.notna(x) else "N/A")
-        logbook_df_display["ratio"] = logbook_df_display["ratio"].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "N/A")
         logbook_df_display["timestamp"] = logbook_df_display["timestamp"].dt.strftime("%H:%M:%S")
         st.dataframe(logbook_df_display, use_container_width=True, hide_index=True, height=500)
     st.markdown("</div>", unsafe_allow_html=True)
