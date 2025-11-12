@@ -1,67 +1,48 @@
 import sqlite3
 from contextlib import closing
 from pathlib import Path
-
 import pandas as pd
 import streamlit as st
+import time as time_module
 
+# === CONFIG ===
 REFRESH_INTERVAL_SECONDS = 5
 
-# Setup database path - use local AppData to avoid OneDrive sync conflicts
-# Fallback: use project data folder if local path fails
-LOCAL_DB_DIR = Path.home() / "AppData" / "Local" / "taranveer_app"
-try:
-    LOCAL_DB_DIR.mkdir(parents=True, exist_ok=True)
-    DB_PATH = LOCAL_DB_DIR / "penny_basing.db"
-except Exception:
-    BASE_DIR = Path(__file__).resolve().parent
-    DB_DIR = BASE_DIR / "data"
-    DB_DIR.mkdir(parents=True, exist_ok=True)
-    DB_PATH = DB_DIR / "penny_basing.db"
+# === DATABASE PATH: Use same as your bot (current folder) ===
+DB_PATH = Path("penny_basing.db").resolve()  # <-- Matches your bot
 
-
+# === INIT DATABASE (Only creates if missing) ===
 def init_db() -> None:
-    """Ensure the alerts table exists."""
+    """Ensure the alerts table exists with correct schema."""
     try:
         with closing(sqlite3.connect(str(DB_PATH))) as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='alerts'"
-            )
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='alerts'")
             if not cursor.fetchone():
-                cursor.execute(
-                    """
+                cursor.execute('''
                     CREATE TABLE alerts (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        timestamp INTEGER NOT NULL,
-                        symbol TEXT NOT NULL,
-                        direction TEXT,
-                        price REAL,
+                        timestamp REAL,
+                        symbol TEXT,
                         ratio REAL,
                         total_bids INTEGER,
                         total_asks INTEGER,
-                        heavy_venues TEXT,
-                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                        heavy_venues INTEGER,
+                        direction TEXT,
+                        price REAL
                     )
-                    """
-                )
+                ''')
                 conn.commit()
-    except Exception:
-        # Silently fail, app will handle empty results
-        pass
-
+    except Exception as e:
+        st.error(f"Failed to initialize DB: {e}")
 
 def init_positions_table() -> None:
     """Create positions table if it doesn't exist."""
     try:
         with closing(sqlite3.connect(str(DB_PATH))) as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='positions'"
-            )
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='positions'")
             if not cursor.fetchone():
-                cursor.execute(
-                    """
+                cursor.execute('''
                     CREATE TABLE positions (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         symbol TEXT NOT NULL,
@@ -74,26 +55,24 @@ def init_positions_table() -> None:
                         pnl_percent REAL,
                         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                     )
-                    """
-                )
+                ''')
                 conn.commit()
     except Exception:
         pass
 
-
+# Initialize
 init_db()
 init_positions_table()
 
-st.set_page_config(page_title="Arbitrage Tracker Dashboard", layout="wide")
+# === STREAMLIT UI ===
+st.set_page_config(page_title="Penny Basing Alerts", layout="wide")
+st.title("Penny Basing Alerts Dashboard")
 
-st.title("Penny Basing Alerts")
+# === CSS Styling ===
 st.markdown(
     """
     <style>
-    body {
-        background-color: #0f172a;
-        color: #f8fafc;
-    }
+    body { background-color: #0f172a; color: #f8fafc; }
     .panel {
         padding: 1.5rem;
         border-radius: 1.25rem;
@@ -105,22 +84,14 @@ st.markdown(
     .log-panel {
         background: linear-gradient(160deg, rgba(15, 23, 42, 0.85), rgba(15, 23, 42, 0.55));
     }
-    .alert-header {
-        font-size: 1.05rem;
-        font-weight: 600;
-        margin-bottom: 0.35rem;
-    }
-    .alert-meta {
-        font-size: 0.85rem;
-        opacity: 0.85;
-        margin-bottom: 0.75rem;
-    }
+    .alert-header { font-size: 1.05rem; font-weight: 600; margin-bottom: 0.35rem; }
+    .alert-meta { font-size: 0.85rem; opacity: 0.85; margin-bottom: 0.75rem; }
     .stExpander > div > div {
         border: 1px solid rgba(148, 163, 184, 0.25);
         border-radius: 0.85rem;
         background-color: rgba(15, 23, 42, 0.45);
     }
-    .stDataFrame div[data-testid="stDataFrame"] {
+    .stDataFrame [data-testid="stDataFrame"] {
         background-color: rgba(15, 23, 42, 0.25);
         border-radius: 0.85rem;
     }
@@ -129,200 +100,129 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-
+# === DATA LOADING ===
 def load_alerts() -> pd.DataFrame:
     try:
         with closing(sqlite3.connect(str(DB_PATH))) as conn:
-            df = pd.read_sql_query(
-                "SELECT * FROM alerts ORDER BY timestamp DESC",
-                conn,
-            )
+            df = pd.read_sql_query("SELECT * FROM alerts ORDER BY timestamp DESC", conn)
     except Exception as exc:
-        st.warning(f"⚠️ Database issue: {exc}")
-        st.info(f"📍 Looking for database at: `{DB_PATH}`")
-        st.write("Make sure the trading bot is running and creating alerts...")
+        st.warning(f"Database issue: {exc}")
+        st.info(f"Looking for DB at: `{DB_PATH}`")
+        st.write("Make sure your bot is running and saving to `penny_basing.db` in this folder.")
         return pd.DataFrame()
 
     if df.empty:
         return df
 
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True).dt.tz_convert(
-        None
-    )
+    # Convert Unix float timestamp → local time
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True, errors='coerce').dt.tz_convert(None)
     return df
-
 
 def update_logbook(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame:
     if incoming.empty:
         return existing
-
     combined = pd.concat([incoming, existing], ignore_index=True)
-    combined = combined.drop_duplicates().sort_values("timestamp", ascending=False)
+    combined = combined.drop_duplicates(subset=["timestamp", "symbol"]).sort_values("timestamp", ascending=False)
     return combined.reset_index(drop=True)
-
 
 def load_positions() -> pd.DataFrame:
     try:
         with closing(sqlite3.connect(str(DB_PATH))) as conn:
-            df = pd.read_sql_query(
-                "SELECT * FROM positions WHERE status='open' ORDER BY entry_time DESC",
-                conn,
-            )
+            df = pd.read_sql_query("SELECT * FROM positions WHERE status='open' ORDER BY entry_time DESC", conn)
     except Exception:
         return pd.DataFrame()
-
     return df
 
-
+# === SESSION STATE ===
 if "logbook" not in st.session_state:
     st.session_state["logbook"] = pd.DataFrame()
 
+# Load data
 alerts_df = load_alerts()
 st.session_state["logbook"] = update_logbook(st.session_state["logbook"], alerts_df)
 
-st.markdown("### 📊 Recent Ticker Alerts (Latest per Stock)")
+# === MAIN UI ===
+st.markdown("### Latest Alerts (One Per Symbol)")
 
 if not alerts_df.empty:
     latest_per_symbol = alerts_df.drop_duplicates(subset=["symbol"], keep="first")
     cols = st.columns(min(len(latest_per_symbol), 5))
-
     for idx, (_, row) in enumerate(latest_per_symbol.iterrows()):
         with cols[idx % 5]:
             symbol = row.get("symbol", "Unknown")
             direction = row.get("direction", "N/A")
-            price = row.get("price", "N/A")
-            ratio = row.get("ratio", "N/A")
+            price = row.get("price", 0.0)
+            ratio = row.get("ratio", 0.0)
+            price_str = f"${float(price):.3f}" if pd.notna(price) else "N/A"
+            ratio_str = f"{float(ratio):.2f}" if pd.notna(ratio) else "N/A"
 
-            price_str = f"${float(price):.2f}" if pd.notna(price) else "N/A"
-
-            if direction == "BUY":
-                color = "🟢"
-            elif direction == "SELL":
-                color = "🔴"
+            # Color logic
+            if "bid" in direction.lower():
+                color = "BUY"
+            elif "ask" in direction.lower():
+                color = "SELL"
             else:
-                color = "⚪"
+                color = "NEUTRAL"
 
             st.metric(
                 label=f"{color} {symbol}",
                 value=price_str,
-                delta=f"{direction} | Ratio: {ratio}",
+                delta=f"{direction} | Ratio: {ratio_str}",
             )
 else:
-    st.info("No alerts available yet")
+    st.info("No alerts yet. Waiting for bot...")
 
 st.divider()
 
+# === POSITIONS + LOGBOOK ===
 positions_col, logbook_col = st.columns([1, 1.2], gap="large")
 
 with positions_col:
     st.markdown("<div class='panel alert-panel'>", unsafe_allow_html=True)
-    st.subheader("💰 Open Positions")
-
+    st.subheader("Open Positions")
     positions_df = load_positions()
-
     if positions_df.empty:
-        st.info("No open positions. Ready to trade!")
+        st.info("No open positions.")
     else:
-        display_positions = positions_df[
-            ["symbol", "quantity", "entry_price", "current_price", "pnl", "pnl_percent"]
-        ].copy()
-
-        display_positions["entry_price"] = display_positions["entry_price"].apply(
-            lambda value: f"${value:.2f}"
-        )
-        display_positions["current_price"] = display_positions["current_price"].apply(
-            lambda value: f"${value:.2f}"
-        )
-        display_positions["pnl"] = display_positions["pnl"].apply(
-            lambda value: f"${value:+.2f}"
-        )
-        display_positions["pnl_percent"] = display_positions["pnl_percent"].apply(
-            lambda value: f"{value:+.1f}%"
-        )
-
-        display_positions.columns = [
-            "Symbol",
-            "Qty",
-            "Entry",
-            "Current",
-            "P&L $",
-            "P&L %",
-        ]
-
-        st.dataframe(display_positions, use_container_width=True, hide_index=True)
+        display = positions_df[["symbol", "quantity", "entry_price", "current_price", "pnl", "pnl_percent"]].copy()
+        display["entry_price"] = display["entry_price"].apply(lambda x: f"${x:.3f}")
+        display["current_price"] = display["current_price"].apply(lambda x: f"${x:.3f}")
+        display["pnl"] = display["pnl"].apply(lambda x: f"${x:+.2f}")
+        display["pnl_percent"] = display["pnl_percent"].apply(lambda x: f"{x:+.1f}%")
+        display.columns = ["Symbol", "Qty", "Entry", "Current", "P&L $", "P&L %"]
+        st.dataframe(display, use_container_width=True, hide_index=True)
 
         total_pnl = positions_df["pnl"].sum()
         gross_cost = (positions_df["entry_price"] * positions_df["quantity"]).sum()
-        total_pnl_percent = (total_pnl / gross_cost * 100) if gross_cost > 0 else 0
-
-        pnl_col, count_col = st.columns(2)
-        with pnl_col:
-            st.metric("Total P&L", f"${total_pnl:+.2f}", delta=f"{total_pnl_percent:+.1f}%")
-        with count_col:
-            st.metric("Open Positions", len(positions_df))
-
+        total_pnl_pct = (total_pnl / gross_cost * 100) if gross_cost > 0 else 0
+        c1, c2 = st.columns(2)
+        with c1: st.metric("Total P&L", f"${total_pnl:+.2f}", delta=f"{total_pnl_pct:+.1f}%")
+        with c2: st.metric("Open Trades", len(positions_df))
     st.markdown("</div>", unsafe_allow_html=True)
 
 with logbook_col:
     st.markdown("<div class='panel log-panel'>", unsafe_allow_html=True)
-    st.subheader("📋 Alert Logbook")
-
+    st.subheader("Alert Logbook")
     logbook_df = st.session_state["logbook"]
-
     if logbook_df.empty:
-        st.info("No log entries yet. New activity will appear here automatically.")
+        st.info("No alerts logged yet.")
     else:
-        display_cols = [
-            column
-            for column in [
-                "timestamp",
-                "symbol",
-                "direction",
-                "price",
-                "ratio",
-                "total_bids",
-                "total_asks",
-                "heavy_venues",
-            ]
-            if column in logbook_df.columns
-        ]
-
-        st.markdown(
-            """
-            <style>
-            .scrollable-logbook {
-                max-height: 500px;
-                overflow-y: auto;
-                border: 1px solid rgba(148, 163, 184, 0.25);
-                border-radius: 0.5rem;
-                padding: 1rem;
-                background-color: rgba(15, 23, 42, 0.25);
-            }
-            </style>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        st.dataframe(
-            logbook_df[display_cols],
-            use_container_width=True,
-            hide_index=True,
-            height=500,
-        )
-
+        cols_to_show = [c for c in ["timestamp", "symbol", "direction", "price", "ratio", "total_bids", "total_asks", "heavy_venues"] if c in logbook_df.columns]
+        logbook_df_display = logbook_df[cols_to_show].copy()
+        logbook_df_display["price"] = logbook_df_display["price"].apply(lambda x: f"${x:.3f}" if pd.notna(x) else "N/A")
+        logbook_df_display["ratio"] = logbook_df_display["ratio"].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "N/A")
+        logbook_df_display["timestamp"] = logbook_df_display["timestamp"].dt.strftime("%H:%M:%S")
+        st.dataframe(logbook_df_display, use_container_width=True, hide_index=True, height=500)
     st.markdown("</div>", unsafe_allow_html=True)
 
-import time as time_module
-
+# === AUTO REFRESH ===
 refresh_col, info_col = st.columns([1, 3])
 with refresh_col:
-    if st.button("🔄 Refresh Now"):
+    if st.button("Refresh Now"):
         st.rerun()
-
 with info_col:
-    st.info(
-        f"Auto-refresh every {REFRESH_INTERVAL_SECONDS} seconds (set lower for real-time tracking)"
-    )
+    st.info(f"Auto-refresh every {REFRESH_INTERVAL_SECONDS} seconds")
 
+# Auto-refresh
 time_module.sleep(REFRESH_INTERVAL_SECONDS)
 st.rerun()
