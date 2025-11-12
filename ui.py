@@ -35,34 +35,8 @@ def init_db() -> None:
     except Exception as e:
         st.error(f"Failed to initialize DB: {e}")
 
-def init_positions_table() -> None:
-    """Create positions table if it doesn't exist."""
-    try:
-        with closing(sqlite3.connect(str(DB_PATH))) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='positions'")
-            if not cursor.fetchone():
-                cursor.execute('''
-                    CREATE TABLE positions (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        symbol TEXT NOT NULL,
-                        entry_price REAL NOT NULL,
-                        current_price REAL NOT NULL,
-                        quantity INTEGER NOT NULL,
-                        entry_time DATETIME DEFAULT CURRENT_TIMESTAMP,
-                        status TEXT DEFAULT 'open',
-                        pnl REAL,
-                        pnl_percent REAL,
-                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                    )
-                ''')
-                conn.commit()
-    except Exception:
-        pass
-
 # Initialize
 init_db()
-init_positions_table()
 
 # === STREAMLIT UI ===
 st.set_page_config(page_title="Penny Basing Alerts", layout="wide")
@@ -125,10 +99,10 @@ def update_logbook(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFra
     combined = combined.drop_duplicates(subset=["timestamp", "symbol"]).sort_values("timestamp", ascending=False)
     return combined.reset_index(drop=True)
 
-def load_positions() -> pd.DataFrame:
+def load_paper_positions() -> pd.DataFrame:
     try:
         with closing(sqlite3.connect(str(DB_PATH))) as conn:
-            df = pd.read_sql_query("SELECT * FROM positions WHERE status='open' ORDER BY entry_time DESC", conn)
+            df = pd.read_sql_query("SELECT * FROM paper_positions", conn)
     except Exception:
         return pd.DataFrame()
     return df
@@ -180,11 +154,11 @@ positions_col, logbook_col = st.columns([1, 1.2], gap="large")
 with positions_col:
     st.markdown("<div class='panel alert-panel'>", unsafe_allow_html=True)
     st.subheader("Open Positions")
-    positions_df = load_positions()
+    positions_df = load_paper_positions()
     if positions_df.empty:
-        st.info("No open positions.")
+        st.info("No paper positions.")
     else:
-        display = positions_df[["symbol", "quantity", "entry_price", "current_price", "pnl", "pnl_percent"]].copy()
+        display = positions_df[["symbol", "qty", "entry_price", "current_price", "pnl", "pnl_percent"]].copy()
         display["entry_price"] = display["entry_price"].apply(lambda x: f"${x:.3f}")
         display["current_price"] = display["current_price"].apply(lambda x: f"${x:.3f}")
         display["pnl"] = display["pnl"].apply(lambda x: f"${x:+.2f}")
@@ -193,7 +167,7 @@ with positions_col:
         st.dataframe(display, use_container_width=True, hide_index=True)
 
         total_pnl = positions_df["pnl"].sum()
-        gross_cost = (positions_df["entry_price"] * positions_df["quantity"]).sum()
+        gross_cost = (positions_df["entry_price"] * positions_df["qty"]).sum()
         total_pnl_pct = (total_pnl / gross_cost * 100) if gross_cost > 0 else 0
         c1, c2 = st.columns(2)
         with c1: st.metric("Total P&L", f"${total_pnl:+.2f}", delta=f"{total_pnl_pct:+.1f}%")
