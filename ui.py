@@ -66,7 +66,6 @@ init_positions_table()
 
 # === STREAMLIT UI ===
 st.set_page_config(page_title="Penny Basing Alerts", layout="wide")
-st.title("Penny Basing Alerts Dashboard")
 
 # === CSS Styling ===
 st.markdown(
@@ -83,6 +82,15 @@ st.markdown(
     }
     .log-panel {
         background: linear-gradient(160deg, rgba(15, 23, 42, 0.85), rgba(15, 23, 42, 0.55));
+    }
+    .section-title {
+        font-size: 1.35rem;
+        font-weight: 600;
+        margin: 0 0 0.85rem 0;
+        color: #f8fafc;
+    }
+    .section-title::before {
+        content: none !important;
     }
     .alert-header { font-size: 1.05rem; font-weight: 600; margin-bottom: 0.35rem; }
     .alert-meta { font-size: 0.85rem; opacity: 0.85; margin-bottom: 0.75rem; }
@@ -142,7 +150,7 @@ alerts_df = load_alerts()
 st.session_state["logbook"] = update_logbook(st.session_state["logbook"], alerts_df)
 
 # === MAIN UI ===
-st.markdown("### Latest Alerts (One Per Symbol)")
+st.markdown("<h3 class='section-title'>Latest Alerts (One Per Symbol)</h3>", unsafe_allow_html=True)
 
 if not alerts_df.empty:
     latest_per_symbol = alerts_df.drop_duplicates(subset=["symbol"], keep="first")
@@ -179,7 +187,7 @@ positions_col, logbook_col = st.columns([1, 1.2], gap="large")
 
 with positions_col:
     st.markdown("<div class='panel alert-panel'>", unsafe_allow_html=True)
-    st.subheader("Open Positions")
+    st.markdown("<h3 class='section-title'>Open Positions</h3>", unsafe_allow_html=True)
     positions_df = load_positions()
     if positions_df.empty:
         st.info("No open positions.")
@@ -202,7 +210,7 @@ with positions_col:
 
 with logbook_col:
     st.markdown("<div class='panel log-panel'>", unsafe_allow_html=True)
-    st.subheader("Alert Logbook")
+    st.markdown("<h3 class='section-title'>Alert Log</h3>", unsafe_allow_html=True)
     logbook_df = st.session_state["logbook"]
     if logbook_df.empty:
         st.info("No alerts logged yet.")
