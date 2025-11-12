@@ -1,62 +1,65 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# run_both.sh – S/R → grok.py → BUY/SELL alerts
+# Taranveer Singh @taranve63826864
 
-echo "Starting Trading Alert Bot..."
+set -euo pipefail          # safe bash
+IFS=$'\n\t'
 
-# Ensure working directory is correct
-cd /Users/taranveersingh/application-Software/remote_server/Trading\ alert\ bot
+# ────────────────────── CONFIG ──────────────────────
+PYTHON_BIN="python3"               # or full path to your venv python
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ALERTS_FILE="${BASE_DIR}/alerts.txt"
+SUP_LOG="${BASE_DIR}/sup_res.log"
+GROK_LOG="${BASE_DIR}/grok.log"
 
-# Load .env file
-if [ -f .env ]; then
-    echo "Loading .env file..."
-    source .env
+# ────────────────────── CLEANUP ──────────────────────
+cleanup() {
+    local exit_code=${1:-0}
+
+    # kill background jobs if they exist
+    for pid_var in SUP_PID GROK_PID; do
+        if [[ -n "${!pid_var:-}" ]] && kill -0 "${!pid_var}" 2>/dev/null; then
+            kill "${!pid_var}" 2>/dev/null || true
+        fi
+        wait "${!pid_var:-}" 2>/dev/null || true
+        unset "$pid_var"
+    done
+
+    exit "$exit_code"
+}
+
+trap 'cleanup 130' INT
+trap 'cleanup 143' TERM
+trap 'cleanup $?' EXIT
+
+# ────────────────────── ONE-TIME SCAN ──────────────────────
+echo "Updating support/resistance watchlist..."
+if ! "$PYTHON_BIN" sup_res.py --once --output "$ALERTS_FILE" | tee "$SUP_LOG"; then
+    echo "Initial sup_res scan failed. See $SUP_LOG"
+    exit 1
+fi
+
+# ────────────────────── EXTRACT TICKERS ──────────────────────
+SYMBOLS_LINE=$(awk -F ':' '/^TICKERS:/ {gsub(/ /,"",$2); print $2}' "$ALERTS_FILE")
+if [[ -n "$SYMBOLS_LINE" ]]; then
+    echo "Starting grok.py with symbols: $SYMBOLS_LINE"
+    "$PYTHON_BIN" grok.py --symbols "$SYMBOLS_LINE" \
+        --min-volume 100000 \
+        > "$GROK_LOG" 2>&1 &
+    GROK_PID=$!
+    echo "grok.py log → $GROK_LOG"
 else
-    echo "❌ .env file not found at $(pwd)/.env"
-    exit 1
+    echo "No tickers yet – grok.py will start after first alert."
 fi
 
-# Check environment variables
-if [ -z "$SCHWAB_CLIENT_ID" ] || [ -z "$SCHWAB_APP_SECRET" ] || [ -z "$SCHWAB_REDIRECT_URI" ] || [ -z "$SCHWAB_ACCOUNT_ID" ]; then
-    echo "❌ Missing required environment variables:"
-    echo "SCHWAB_CLIENT_ID: $SCHWAB_CLIENT_ID"
-    echo "SCHWAB_APP_SECRET: $SCHWAB_APP_SECRET"
-    echo "SCHWAB_REDIRECT_URI: $SCHWAB_REDIRECT_URI"
-    echo "SCHWAB_ACCOUNT_ID: $SCHWAB_ACCOUNT_ID"
-    echo "Please check your .env file:"
-    cat .env
-    exit 1
-fi
+# ────────────────────── CONTINUOUS MONITOR ──────────────────────
+echo "Starting continuous sup_res monitor..."
+"$PYTHON_BIN" sup_res.py --watch --output "$ALERTS_FILE" \
+    >> "$SUP_LOG" 2>&1 &
+SUP_PID=$!
+echo "sup_res log → $SUP_LOG"
 
-# Generate tokens if missing
-if [ ! -f "$SCHWAB_TOKEN_PATH" ]; then
-    echo "Generating Schwab tokens..."
-    python -c "import os; from schwab.auth import easy_client; from dotenv import load_dotenv; load_dotenv(); easy_client(api_key=os.getenv('SCHWAB_CLIENT_ID'), app_secret=os.getenv('SCHWAB_APP_SECRET'), callback_url=os.getenv('SCHWAB_REDIRECT_URI'), token_path=os.getenv('SCHWAB_TOKEN_PATH', './schwab_tokens.json'))" || {
-        echo "❌ Token generation failed"
-        exit 1
-    }
-fi
+echo "Trading alert services are running. Press Ctrl+C to stop."
 
-# Start grok.py
-echo "Starting grok.py..."
-python grok.py --symbols SNAP --min-volume 100000 > grok.log 2>&1 &
-GROK_PID=$!
-
-# Wait for grok.py to initialize
-sleep 5
-
-# Check if grok.py is running
-if ! kill -0 $GROK_PID 2>/dev/null; then
-    echo "❌ grok.py failed to start. Check grok.log for errors."
-    cat grok.log
-    exit 1
-fi
-
-echo "✅ grok.py started (PID: $GROK_PID)"
-echo "Starting Streamlit UI..."
-
-# Start Streamlit
-streamlit run ui.py &
-
-echo "✅ Both services started. Access UI at http://localhost:8501"
-echo "Press Ctrl+C to stop..."
-
-wait $GROK_PID
+# Wait for the *watch* process (it never exits on its own)
+wait "$SUP_PID"
