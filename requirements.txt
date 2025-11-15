@@ -1,8 +1,5 @@
-scikit-learn
 pandas
-numpy
-requests
-yfinance
-streamlit
 python-dotenv
 schwab-py
+streamlit
+yfinance
