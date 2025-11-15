@@ -115,11 +115,16 @@ if not alerts_df.empty:
 
     for idx, (_, row) in enumerate(latest.iterrows()):
         with cols[idx % 5]:
-            color = "BUY" if "bid" in row["direction"].lower() else "SELL"
+            direction_text = row["direction"].lower()
+            is_bid = "bid" in direction_text
+            color = "BUY" if is_bid else "SELL"
+            delta_color = "normal" if is_bid else "inverse"
+
             st.metric(
                 label=f"{color} {row['symbol']}",
                 value=f"${row['price']:.3f}",
                 delta=f"{row['direction']}",
+                delta_color=delta_color,
             )
 else:
     st.info("Waiting for alerts...")
