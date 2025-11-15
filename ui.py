@@ -40,7 +40,12 @@ st.markdown(
     """
     <style>
     body { background-color: #0f172a; color: #f8fafc; }
-    .panel { padding: 1.5rem; border-radius: 1.25rem; box-shadow: 0 25px 50px -12px rgba(15, 23, 42, 0.45); }
+    .panel {
+        padding: 1rem 1.5rem 1.5rem;
+        border-radius: 1.25rem;
+        box-shadow: 0 25px 50px -12px rgba(15, 23, 42, 0.45);
+    }
+    .panel h3 { margin-top: 0; }
     .alert-panel { background: linear-gradient(160deg, rgba(30, 64, 175, 0.85), rgba(30, 64, 175, 0.55)); }
     .log-panel { background: linear-gradient(160deg, rgba(15, 23, 42, 0.85), rgba(15, 23, 42, 0.55)); }
     .stDataFrame [data-testid="stDataFrame"] { background-color: rgba(15, 23, 42, 0.25); border-radius: 0.85rem; }
@@ -110,16 +115,27 @@ if not alerts_df.empty:
 
     for idx, (_, row) in enumerate(latest.iterrows()):
         with cols[idx % 5]:
-            color = "BUY" if "bid" in row["direction"].lower() else "SELL"
-            st.metric(
-                label=f"{color} {row['symbol']}",
-                value=f"${row['price']:.3f}",
-                delta=f"{row['direction']}",
-            )
-else:
-    st.info("Waiting for alerts...")
+            direction_text = row["direction"].lower()
 
-st.divider()
+            if "bid" in direction_text:
+                # bid-heavy → UP arrow (green)
+                label = f"BUY {row['symbol']}"
+                delta = "bid-heavy"
+                delta_color = "normal"     # UP arrow
+            else:
+                # ask-heavy → DOWN arrow (red)
+                label = f"SELL {row['symbol']}"
+                delta = "ask-heavy"
+                delta_color = "inverse"    # DOWN arrow
+
+            st.metric(
+                label=label,
+                value=f"${row['price']:.3f}",
+                delta=delta,
+                delta_color=delta_color,
+            )
+
+    st.divider()
 
 # ===================== LAYOUT COLUMNS =====================
 
@@ -128,7 +144,6 @@ positions_col, logbook_col = st.columns([1, 1.2], gap="large")
 # ===================== OPEN POSITIONS PANEL =====================
 
 with positions_col:
-    st.markdown("<div class='panel alert-panel'>", unsafe_allow_html=True)
     st.markdown("### Open Positions")
 
     positions_df = load_paper_positions()
@@ -165,7 +180,6 @@ with positions_col:
 # ===================== ALERT LOG PANEL =====================
 
 with logbook_col:
-    st.markdown("<div class='panel log-panel'>", unsafe_allow_html=True)
     st.markdown("### Alert Log")
 
     logbook_df = st.session_state["logbook"]
