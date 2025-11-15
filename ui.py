@@ -116,21 +116,26 @@ if not alerts_df.empty:
     for idx, (_, row) in enumerate(latest.iterrows()):
         with cols[idx % 5]:
             direction_text = row["direction"].lower()
-            is_bid = "bid" in direction_text
-            color = "BUY" if is_bid else "SELL"
-            delta_color = "normal" if is_bid else "inverse"
-            arrow = "▲" if is_bid else "▼"
+
+            if "bid" in direction_text:
+                # bid-heavy → UP arrow (green)
+                label = f"BUY {row['symbol']}"
+                delta = "bid-heavy"
+                delta_color = "normal"     # UP arrow
+            else:
+                # ask-heavy → DOWN arrow (red)
+                label = f"SELL {row['symbol']}"
+                delta = "ask-heavy"
+                delta_color = "inverse"    # DOWN arrow
 
             st.metric(
-                label=f"{color} {row['symbol']}",
+                label=label,
                 value=f"${row['price']:.3f}",
-                delta=f"{arrow} {row['direction']}",
+                delta=delta,
                 delta_color=delta_color,
             )
-else:
-    st.info("Waiting for alerts...")
 
-st.divider()
+    st.divider()
 
 # ===================== LAYOUT COLUMNS =====================
 
@@ -139,7 +144,6 @@ positions_col, logbook_col = st.columns([1, 1.2], gap="large")
 # ===================== OPEN POSITIONS PANEL =====================
 
 with positions_col:
-    st.markdown("<div class='panel alert-panel'>", unsafe_allow_html=True)
     st.markdown("### Open Positions")
 
     positions_df = load_paper_positions()
@@ -176,7 +180,6 @@ with positions_col:
 # ===================== ALERT LOG PANEL =====================
 
 with logbook_col:
-    st.markdown("<div class='panel log-panel'>", unsafe_allow_html=True)
     st.markdown("### Alert Log")
 
     logbook_df = st.session_state["logbook"]
