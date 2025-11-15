@@ -119,11 +119,12 @@ if not alerts_df.empty:
             is_bid = "bid" in direction_text
             color = "BUY" if is_bid else "SELL"
             delta_color = "normal" if is_bid else "inverse"
+            arrow = "▲" if is_bid else "▼"
 
             st.metric(
                 label=f"{color} {row['symbol']}",
                 value=f"${row['price']:.3f}",
-                delta=f"{row['direction']}",
+                delta=f"{arrow} {row['direction']}",
                 delta_color=delta_color,
             )
 else:
