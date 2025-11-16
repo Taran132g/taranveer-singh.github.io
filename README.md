@@ -85,6 +85,23 @@ This guides you through the browser login flow and saves the token file defined 
 
 3. **Optional combined launcher** – Update the `cd` path inside `run_both.sh` and execute it to start both services in one command. Use `stop_trading_bot.sh` to terminate them.
 
+## Going from paper mode to Schwab paperMoney orders
+The new `live_trader.py` script reuses the flip-only logic from `paper_trader.py` but swaps the execution layer for Schwab’s REST order APIs. It tails the same `alerts` table and can be pointed at your paperMoney account hash.
+
+1. Make sure your `.env` already contains `SCHWAB_CLIENT_ID`, `SCHWAB_APP_SECRET`, `SCHWAB_REDIRECT_URI`, `SCHWAB_ACCOUNT_ID`, and `SCHWAB_TOKEN_PATH`. For paper trading, set `SCHWAB_ACCOUNT_ID` to the paperMoney account hash shown in the Developer Portal.
+2. Optional environment overrides:
+   - `LIVE_POSITION_SIZE`, `LIVE_SHORT_SIZE` – share sizes for bid-heavy/ask-heavy signals (fallback to `POSITION_SIZE`/`SHORT_SIZE`).
+   - `LIVE_POLL_INTERVAL` – seconds between alert polls (default `1`).
+   - `LIVE_STATE_FILE` – JSON path for persisted position state (default `live_trader_state.json`).
+   - `LIVE_DRY_RUN` – set to `1`/`true` to log orders without sending them.
+3. Start the bridge. Use `--dry-run` the first time to confirm wiring without touching the API:
+   ```bash
+   python live_trader.py --dry-run
+   # then drop --dry-run once you trust the flow
+   ```
+
+Every alert handled by the script is logged to a new `live_orders` table alongside the Schwab response metadata so you can audit what was sent. Because it talks directly to Schwab, ensure your OAuth tokens (`schwab_tokens.json`) are fresh before launching it.
+
 ## Support/resistance scanning
 The `sup_res.py` script scans the Nasdaq universe loaded from `nasdaq_2_to_50_stocks.csv`.
 ```bash
