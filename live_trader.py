@@ -241,14 +241,29 @@ class LiveTrader:
             )
             conn.commit()
 
-    def _submit_order(self, *, alert_id: int, symbol: str, direction: str, side: str, qty: int, price: float) -> None:
+    def _submit_order(self, *, alert_id: int, symbol: str, direction: str, side: str, qty: int, price: float) -> bool:
         result = self.executor.submit_market(symbol=symbol, qty=qty, side=side)
-        success = result.get("error") is None and (result.get("dry_run") or result.get("status_code") not in {None, ""} and str(result.get("status_code")).startswith("2"))
-        if success:
+        success = result.get("error") is None and (
+            result.get("dry_run")
+            or (
+                result.get("status_code") not in {None, ""}
+                and str(result.get("status_code")).startswith("2")
+            )
+        )
+        if success and not result.get("dry_run"):
             delta = qty if side in {"BUY", "COVER"} else -qty
             self._apply_position_delta(symbol, delta)
             self._save_state()
-        self._record_order(alert_id=alert_id, symbol=symbol, direction=direction, side=side, qty=qty, price=price, result=result)
+        self._record_order(
+            alert_id=alert_id,
+            symbol=symbol,
+            direction=direction,
+            side=side,
+            qty=qty,
+            price=price,
+            result=result,
+        )
+        return success
 
     def _handle_alert(self, alert_id: int, symbol: str, direction: str, price: float) -> None:
         position = self.positions.get(symbol, 0)
@@ -257,14 +272,56 @@ class LiveTrader:
             if position < 0:
                 return
             if position > 0:
-                self._submit_order(alert_id=alert_id, symbol=symbol, direction=direction, side="SELL", qty=position, price=price)
-            self._submit_order(alert_id=alert_id, symbol=symbol, direction=direction, side="SHORT", qty=self.short_size, price=price)
+                flattened = self._submit_order(
+                    alert_id=alert_id,
+                    symbol=symbol,
+                    direction=direction,
+                    side="SELL",
+                    qty=position,
+                    price=price,
+                )
+                if not flattened:
+                    LOGGER.warning(
+                        "Skipping SHORT on %s because closing SELL failed (alert %s)",
+                        symbol,
+                        alert_id,
+                    )
+                    return
+            self._submit_order(
+                alert_id=alert_id,
+                symbol=symbol,
+                direction=direction,
+                side="SHORT",
+                qty=self.short_size,
+                price=price,
+            )
         elif direction == "bid-heavy":
             if position > 0:
                 return
             if position < 0:
-                self._submit_order(alert_id=alert_id, symbol=symbol, direction=direction, side="COVER", qty=abs(position), price=price)
-            self._submit_order(alert_id=alert_id, symbol=symbol, direction=direction, side="BUY", qty=self.position_size, price=price)
+                flattened = self._submit_order(
+                    alert_id=alert_id,
+                    symbol=symbol,
+                    direction=direction,
+                    side="COVER",
+                    qty=abs(position),
+                    price=price,
+                )
+                if not flattened:
+                    LOGGER.warning(
+                        "Skipping BUY on %s because closing COVER failed (alert %s)",
+                        symbol,
+                        alert_id,
+                    )
+                    return
+            self._submit_order(
+                alert_id=alert_id,
+                symbol=symbol,
+                direction=direction,
+                side="BUY",
+                qty=self.position_size,
+                price=price,
+            )
 
     def run(self) -> None:
         LOGGER.info("Monitoring alerts from %s (poll %.1fs)", self.db_path, self.poll_interval)
