@@ -627,7 +627,7 @@ async def resolve_exchange(client: Client, sym: str) -> Optional[str]:
     if sym in exchange_cache:
         return exchange_cache[sym]
     try:
-        instruments = await client.get_instruments([sym])
+        instruments = await client.get_instruments([sym], projection="fundamental")
         for inst in instruments:
             if inst.get("symbol") == sym:
                 exchange = inst.get("primary_exchange")
@@ -732,7 +732,10 @@ async def main():
     MIN_VOLUME = args.min_volume if args.min_volume is not None else _get_int_env("MIN_VOLUME", 100000, 1000)
     MIN_IMBALANCE_DURATION_SEC = args.min_imbalance_duration if args.min_imbalance_duration is not None else _get_float_env("MIN_IMBALANCE_DURATION_SEC", 10.0, 0.0)
     DB_PATH = args.db_path if args.db_path is not None else os.getenv("DB_PATH", "penny_basing.db")
-    SYMBOLS = _parse_symbols_from_env("SYMBOLS", "F") if not args.symbols else _parse_symbols_from_env(fallback=args.symbols)
+    # if args.symbols:
+    #     SYMBOLS = [s.strip().upper() for s in args.symbols.replace(" ", ",").split(",") if s.strip()]
+    # else:
+    SYMBOLS = _parse_symbols_from_env("SYMBOLS", "F")
     DISABLE_BID_HEAVY = bool(args.disable_bid_heavy)
     DEBUG_BOOK_RAW = bool(args.debug_book_raw)
     JSON_BOOK = bool(args.json_book)
