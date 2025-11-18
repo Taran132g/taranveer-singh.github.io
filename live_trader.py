@@ -131,12 +131,14 @@ class LiveTrader:
         self.poll_interval = float(os.getenv("LIVE_POLL_INTERVAL", "1"))
         self.state_path = Path(os.getenv("LIVE_STATE_FILE", "live_trader_state.json"))
         self.executor = SchwabOrderExecutor(dry_run=dry_run)
+        self.dry_run = self.executor.dry_run
         self.positions: Dict[str, int] = {}
         self.last_alert_id = 0
 
         self._load_state()
         self._init_db_schema()
-        atexit.register(self._save_state)
+        if not self.dry_run:
+            atexit.register(self._save_state)
 
     # ------------------------------------------------------------------
     # State & persistence helpers
@@ -153,6 +155,8 @@ class LiveTrader:
             LOGGER.warning("Failed to load state: %s", exc)
 
     def _save_state(self) -> None:
+        if self.dry_run:
+            return
         payload = {"positions": self.positions, "last_alert_id": self.last_alert_id}
         try:
             self.state_path.write_text(json.dumps(payload, indent=2))
@@ -347,7 +351,7 @@ class LiveTrader:
                 self.last_alert_id = alert_id
                 self._handle_alert(alert_id, symbol, direction, price)
 
-            if rows:
+            if rows and not self.dry_run:
                 self._save_state()
 
             time.sleep(self.poll_interval)
