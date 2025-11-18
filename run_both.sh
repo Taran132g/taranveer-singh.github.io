@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run_all.sh – Starts EVERYTHING: sup_res → grok → paper_trader → UI
+# run_all.sh – Starts EVERYTHING: sup_res → grok → live_trader → UI
 # Taranveer Singh @taranve63826864
 
 set -euo pipefail
@@ -11,15 +11,16 @@ BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ALERTS_FILE="${BASE_DIR}/alerts.txt"
 SUP_LOG="${BASE_DIR}/sup_res.log"
 GROK_LOG="${BASE_DIR}/grok.log"
-PAPER_LOG="${BASE_DIR}/paper_trader.log"
+TRADER_LOG="${BASE_DIR}/live_trader.log"
 UI_LOG="${BASE_DIR}/ui.log"
+LIVE_DRY_RUN="${LIVE_DRY_RUN:-0}"
 
 # ────────────────────── CLEANUP ──────────────────────
 cleanup() {
     local exit_code=${1:-0}
     echo -e "\n[STOP] Shutting down all services..."
 
-    for pid_var in SUP_PID GROK_PID PAPER_PID UI_PID; do
+    for pid_var in SUP_PID GROK_PID TRADER_PID UI_PID; do
         if [[ -n "${!pid_var:-}" ]] && kill -0 "${!pid_var}" 2>/dev/null; then
             echo "   • Stopping $pid_var (PID: ${!pid_var})"
             kill "${!pid_var}" 2>/dev/null || true
@@ -56,11 +57,17 @@ else
     echo "   • grok.py log → $GROK_LOG"
 fi
 
-# ────────────────────── PAPER TRADER ──────────────────────
-echo "[3/4] Starting paper_trader.py (paper money simulation)..."
-"$PYTHON_BIN" -u paper_trader.py > "$PAPER_LOG" 2>&1 &
-PAPER_PID=$!
-echo "   • paper_trader.py log → $PAPER_LOG"
+# ────────────────────── LIVE TRADER ──────────────────────
+TRADER_ARGS=()
+if [[ "$LIVE_DRY_RUN" == "1" ]]; then
+    TRADER_ARGS+=("--dry-run")
+    echo "[3/4] Starting live_trader.py in DRY-RUN mode (no Schwab orders will be sent)..."
+else
+    echo "[3/4] Starting live_trader.py (Schwab bridge)..."
+fi
+"$PYTHON_BIN" -u live_trader.py "${TRADER_ARGS[@]}" > "$TRADER_LOG" 2>&1 &
+TRADER_PID=$!
+echo "   • live_trader.py log → $TRADER_LOG"
 
 # ────────────────────── STREAMLIT UI ──────────────────────
 echo "[4/4] Starting Streamlit UI (ui.py)..."
@@ -84,7 +91,7 @@ echo "   • sup_res watch log → $SUP_LOG"
 echo -e "\nALL SERVICES ARE RUNNING:"
 echo "   • sup_res.py (watch) → $SUP_LOG"
 echo "   • grok.py (alerts)   → $GROK_LOG"
-echo "   • paper_trader.py    → $PAPER_LOG"
+echo "   • live_trader.py     → $TRADER_LOG"
 echo "   • UI (Streamlit)     → http://localhost:8501 | log: $UI_LOG"
 echo -e "\nPress Ctrl+C to stop everything.\n"
 
