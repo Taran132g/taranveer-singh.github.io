@@ -166,7 +166,7 @@ class PaperTrader:
         if pos["qty"] == 0:
             del self.positions[symbol]
 
-        self._update_position_db(symbol)
+        self._update_position_db(symbol, cur_price=price)
 
     # ============================================================
     # Daily PnL reset
@@ -225,7 +225,7 @@ class PaperTrader:
     # ============================================================
     # Update Position Table
     # ============================================================
-    def _update_position_db(self, symbol):
+    def _update_position_db(self, symbol, cur_price=None):
         if symbol not in self.positions:
             with self._open_conn() as conn:
                 cur = conn.cursor()
@@ -234,7 +234,7 @@ class PaperTrader:
             return
 
         pos = self.positions[symbol]
-        cur_price = self._get_current_price(symbol)
+        cur_price = cur_price if cur_price is not None else self._get_current_price(symbol)
 
         qty = pos["qty"]
         entry = pos["entry_price"]
@@ -282,19 +282,22 @@ class PaperTrader:
 
                 # ASK-HEAVY → SHORT
                 if direction == "ask-heavy":
-                    if current_qty < 0:  # already short
-                        continue
                     if current_qty > 0:  # flip long → short
                         self._sell(symbol, current_qty, price)
-                    self._short(symbol, SHORT_SIZE, price)
+                        self._short(symbol, SHORT_SIZE, price)
+                    elif current_qty == 0:  # open new short
+                        self._short(symbol, SHORT_SIZE, price)
 
                 # BID-HEAVY → LONG
                 elif direction == "bid-heavy":
-                    if current_qty > 0:  # already long
-                        continue
                     if current_qty < 0:  # flip short → long
                         self._cover(symbol, abs(current_qty), price)
-                    self._buy(symbol, POSITION_SIZE, price)
+                        self._buy(symbol, POSITION_SIZE, price)
+                    elif current_qty == 0:  # open new long
+                        self._buy(symbol, POSITION_SIZE, price)
+
+                # Update current price and PnL even when no trade is executed
+                self._update_position_db(symbol, cur_price=price)
 
             time.sleep(1)
 
