@@ -1,39 +1,53 @@
-# Trading Alert Bot & Streamlit Dashboard
+# Schwab Level II Alerting, Dashboard, and Trading Bridge
 
-This repository powers a penny-stock basing detector that consumes live Level II order book data from the Schwab streaming API, stores actionable alerts in SQLite, and surfaces them in a Streamlit dashboard. It also contains an end-of-day support/resistance scanner built on Yahoo Finance data.
+This repository contains a full pipeline for spotting heavy bid/ask activity on
+Schwab Level II feeds, storing the signals in SQLite, visualizing them in
+Streamlit, and optionally mirroring them into paper or live Schwab orders. It
+also includes an end-of-day (EOD) support/resistance scanner for a Nasdaq
+universe.
 
-## Features
-- **Real-time alerting (`grok.py`)** – Subscribes to Schwab Level II feeds, tracks heavy bid/ask activity, and records alerts when liquidity conditions trip configurable thresholds.
-- **Interactive dashboard (`ui.py`)** – Streamlit app that renders the latest alerts and open positions out of the SQLite database with auto-refresh styling for quick triage.
-- **Support & resistance watcher (`sup_res.py`)** – Periodically polls a universe of $2–$50 Nasdaq tickers for proximity to weekly, monthly, and yearly levels.
-- **Utility scripts** – OAuth helper (`auth_login.py`), combined launcher (`run_both.sh`), process cleanup (`stop_trading_bot.sh`), and sample SQL queries (`sql.py`).
+```
+┌────────────┐     Level II       ┌────────────┐      alerts.db
+│ Schwab API │ ───────────────▶ │ grok.py    │ ───────┬──────────────┐
+└────────────┘  (quotes/orders)  │ (alert bot)│       │              │
+                                  └────────────┘   SQL │              │
+                                                       ▼              ▼
+                                               paper_trader.py   ui.py (Streamlit)
+                                                       │              ▲
+                                                       ▼              │
+                                                 live_trader.py  Support/Res
+                                                                  sup_res.py
+```
 
-## Repository layout
+## Components
 
 | Path | Purpose |
 | ---- | ------- |
-| `grok.py` | Main Schwab streaming client and alert generator. |
-| `ui.py` | Streamlit UI for viewing alerts/positions from SQLite. |
-| `sup_res.py` | Support/resistance polling loop for Nasdaq symbols. |
-| `auth_login.py` | Creates/refreshed Schwab OAuth tokens using `.env` secrets. |
-| `run_both.sh` | Convenience script to launch `grok.py` and the dashboard together (adjust the hard-coded path first). |
-| `stop_trading_bot.sh` | Kills any running `grok.py` or Streamlit processes. |
-| `sql.py` | Example SQLite readout (edit the database path before running). |
-| `nasdaq_2_to_50_stocks.csv` | Symbol universe used by `sup_res.py`. |
-| `requirements.txt` | Python dependencies for the project. |
+| `grok.py` | Main Schwab streaming client. Normalizes Level II books, calculates rolling window metrics, and inserts alerts/positions into SQLite. |
+| `ui.py` | Streamlit dashboard that auto-refreshes to show the latest alerts, positions, and paper fills. |
+| `paper_trader.py` | Flip-only paper trading engine that tails the `alerts` table, stores fills/PnL, and persists state so you can stop/restart without losing context. |
+| `live_trader.py` | Schwab order bridge that replays the paper trader's signals into paperMoney or live REST endpoints (market orders via `schwab-py`). |
+| `auth_login.py` | Helper to create/refresh Schwab OAuth tokens referenced by every other script. |
+| `sup_res.py` | Support/resistance watcher that walks the Nasdaq `$2–$50` universe defined in `nasdaq_2_to_50_stocks.csv`. |
+| `run_both.sh` / `stop_trading_bot.sh` | Convenience shell scripts for launching/killing the alert bot + dashboard together. |
+| `sql.py` | Example read-only queries for exploring the SQLite database. |
+| `requirements.txt` | Python dependencies for the whole stack. |
 
 ## Prerequisites
-- Python 3.10+ (tested with CPython 3.11).
-- Schwab Developer account with API key, secret, redirect URI, and enabled streaming permissions.
-- Ability to create OAuth tokens via the Schwab login flow (interactive browser access).
+
+- Python 3.10+ (developed against CPython 3.11).
+- Schwab Developer account with API key, app secret, redirect URI, and streaming permissions.
+- Browser access to complete the OAuth login flow when refreshing tokens.
+- (Optional) Schwab paperMoney or live account for `live_trader.py`.
 
 ## Installation
-1. Clone the repository and change into it.
+
+1. Clone the repo and enter it.
    ```bash
    git clone https://github.com/<your-account>/taranveer-singh.github.io.git
    cd taranveer-singh.github.io
    ```
-2. Create and activate a virtual environment (optional but recommended).
+2. Create/activate a virtual environment (recommended).
    ```bash
    python -m venv .venv
    source .venv/bin/activate  # Windows: .venv\Scripts\activate
@@ -45,64 +59,142 @@ This repository powers a penny-stock basing detector that consumes live Level II
    ```
 
 ## Environment configuration
-Create a `.env` file in the project root with at least the following variables:
+
+All scripts rely on a `.env` file in the repo root. The following variables are
+required for the streaming + trading stack:
 
 ```ini
 SCHWAB_CLIENT_ID=your_app_key_without_suffix
 SCHWAB_APP_SECRET=your_app_secret
 SCHWAB_REDIRECT_URI=https://127.0.0.1:8182/
-SCHWAB_ACCOUNT_ID=123456789
-SCHWAB_TOKEN_PATH=./schwab_tokens.json  # optional; defaults to ./schwab_tokens.json
-SYMBOLS=SNAP,F            # optional; overrides the default single symbol (F)
-MIN_VOLUME=150000         # optional; per-symbol minimum shares/minute
-DB_PATH=penny_basing.db   # optional; set a custom SQLite location
+SCHWAB_ACCOUNT_ID=paper_or_live_account_hash
+SCHWAB_TOKEN_PATH=./schwab_tokens.json
+DB_PATH=penny_basing.db          # overrides default SQLite path
+SYMBOLS=SNAP,NVDA                # comma or space separated list
+MIN_VOLUME=150000                # per-symbol shares/minute requirement
 ```
 
-Additional optional knobs:
-- `WINDOW_SECONDS`, `HEARTBEAT_SEC`, `MIN_ASK_HEAVY`, `MIN_BID_HEAVY`, `MAX_RANGE_CENTS`, `ALERT_THROTTLE_SEC`, `MIN_IMBALANCE_DURATION_SEC`, `BOOK_INTERVAL_SEC`, and `BOOK_RAW_LIMIT` tune runtime behavior of `grok.py`.
-- `SYMBOLS` can use either commas or spaces between tickers.
+`grok.py` also honors tuning variables such as `WINDOW_SECONDS`,
+`HEARTBEAT_SEC`, `BOOK_INTERVAL_SEC`, `MIN_ASK_HEAVY`, `MIN_BID_HEAVY`,
+`MAX_RANGE_CENTS`, `ALERT_THROTTLE_SEC`, `MIN_IMBALANCE_DURATION_SEC`, and
+`BOOK_RAW_LIMIT`. Unset variables fall back to the script defaults.
 
 ## Authenticate with Schwab
-Generate and/or refresh the Schwab OAuth token before streaming:
+
+Create or refresh the OAuth token before streaming:
+
 ```bash
 python auth_login.py --force-login
 ```
-This guides you through the browser login flow and saves the token file defined by `SCHWAB_TOKEN_PATH`.
 
-## Running the alert pipeline
-1. **Start the streamer** (requires the `.env` variables and a token file):
+A browser will prompt for Schwab credentials. On success, the token file at
+`SCHWAB_TOKEN_PATH` is updated and reused by every script.
+
+## Running the real-time alert pipeline
+
+1. **Start the streamer.** Supply symbols and optional overrides on the command
+   line (these take precedence over `.env`).
    ```bash
    python grok.py --symbols SNAP,NVDA --min-volume 150000
    ```
-   - Alerts are written into the SQLite database specified by `DB_PATH` (defaults to `penny_basing.db`).
-   - On Windows the Streamlit UI stores data under `%LOCALAPPDATA%\taranveer_app\penny_basing.db`; on other systems a `data/` folder is created beside `ui.py`.
+   - Level II data is normalized per exchange, debounced, and inserted into the
+     `alerts` table inside `DB_PATH`.
+   - Structured logs (INFO/WARN) describe throttling, heartbeat gaps, and alert
+     payloads for debugging.
 
-2. **Launch the dashboard** in a separate terminal:
+2. **Launch the dashboard.**
    ```bash
    streamlit run ui.py
    ```
-   Visit the displayed URL (default `http://localhost:8501`) to view incoming alerts and positions with auto-refresh.
+   The Streamlit app reads the same database and auto-refreshes to show alerts,
+   open positions, and paper fills. On Windows the DB defaults to
+   `%LOCALAPPDATA%\taranveer_app\penny_basing.db`; elsewhere it lives beside
+   `ui.py` unless `DB_PATH` is set.
 
-3. **Optional combined launcher** – Update the `cd` path inside `run_both.sh` and execute it to start both services in one command. Use `stop_trading_bot.sh` to terminate them.
+3. **Optional combined launcher.** Update the `cd` path inside `run_both.sh`
+   before executing it to start `grok.py` + `ui.py` together. Use
+   `stop_trading_bot.sh` to terminate them.
+
+## Paper trading loop
+
+`paper_trader.py` consumes the `alerts` table and flips between long/short
+positions when the alert direction changes (no stacking). Key traits:
+
+- Persists cash + open positions in `paper_trader_state.json` so you can restart
+  intraday.
+- Writes every fill to `paper_trades` and maintains a `paper_positions` table
+  for the dashboard.
+- Respects configurable constants near the top of the script (`POSITION_SIZE`,
+  `SHORT_SIZE`, `SLIPPAGE`, `COMMISSION`).
+
+Run it alongside the streamer:
+
+```bash
+python paper_trader.py
+```
+
+## Live/paperMoney execution bridge
+
+`live_trader.py` mirrors the paper trader's flip-only logic into Schwab REST
+orders. It shares the same `.env` credentials and supports a `LIVE_DRY_RUN=1`
+flag for rehearsals. Typical usage:
+
+```bash
+python live_trader.py --db penny_basing.db --min-alert-id 0
+```
+
+- The script tails the `alerts` table, deduplicates order intents, and submits
+  market orders (`BUY`, `SELL`, `SHORT`, `COVER`) via `schwab-py`.
+- The `--min-alert-id` flag is handy when you want to ignore historical alerts
+  after restarting the bot.
+- Ensure `SCHWAB_ACCOUNT_ID` points to your paperMoney account hash before going
+  live.
 
 ## Support/resistance scanning
-The `sup_res.py` script scans the Nasdaq universe loaded from `nasdaq_2_to_50_stocks.csv`.
+
+The `sup_res.py` utility scans the Nasdaq universe in `nasdaq_2_to_50_stocks.csv`
+for prices approaching 1-week/30-day/52-week levels within a configurable
+band.
+
 ```bash
 python sup_res.py --watch
 ```
-It prints alerts when closing prices break or approach key levels (1-week, 30-day, 52-week) within a 0.5% band, respecting volume and price filters defined near the top of the script.
 
-## Database notes
-- `grok.py` creates/maintains two tables:
-  - `alerts`: timestamped imbalance events (symbol, direction, price, bid/ask totals, heavy venues, etc.).
-  - `positions`: optional table for tracking open trades.
-- `sql.py` demonstrates how to query alerts, but it contains a user-specific path—edit `db_path` before running.
+It prints human-readable alerts and can be run independently of the Level II
+pipeline.
+
+## Database schema
+
+`grok.py` automatically creates:
+
+- `alerts` – timestamped imbalance events with symbol, price, side, aggregate
+  bid/ask volume, heavy venues, etc.
+- `positions` – optional manual entries for currently held trades.
+
+`paper_trader.py` adds:
+
+- `paper_trades` – synthetic fills including slippage/commission and realized
+  PnL.
+- `paper_positions` – current holdings tracked by the paper engine.
+
+`sql.py` contains sample queries (update the `db_path` variable inside before
+running it manually).
 
 ## Troubleshooting
-- **Missing env vars** – `grok.py` and `auth_login.py` enumerate missing variables and exit with `CONFIG_ERROR` messages.
-- **Token errors** – Delete the token file referenced by `SCHWAB_TOKEN_PATH` and re-run `auth_login.py --force-login`.
-- **Database not found** – The Streamlit app displays the expected path in warning messages; confirm the bot is writing to that location.
-- **Dependencies** – If Streamlit or Schwab imports fail, re-run `pip install -r requirements.txt` inside your active virtual environment.
+
+- **Missing env vars** – Scripts raise descriptive `RuntimeError` messages if an
+  expected variable is absent.
+- **Token failures** – Delete the file pointed at by `SCHWAB_TOKEN_PATH` and
+  re-run `python auth_login.py --force-login`.
+- **Database mismatch** – The dashboard prints the exact DB path it is trying
+  to open; make sure it matches the `DB_PATH` used by `grok.py`/`paper_trader.py`.
+- **Schwab throttling** – Watch the `grok.py` logs for `HEARTBEAT` warnings or
+  reconnect messages if the streaming client gets disconnected.
+- **Order errors** – `live_trader.py` logs the Schwab response status and order
+  location headers; double-check account permissions and whether `dry_run` mode
+  is still enabled.
 
 ## License
-No explicit license has been provided. Assume all rights reserved unless the repository owner specifies otherwise.
+
+No explicit license is provided. Assume all rights reserved unless the owner
+states otherwise.
