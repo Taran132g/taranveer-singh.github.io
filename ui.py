@@ -11,6 +11,25 @@ REFRESH_INTERVAL_SECONDS = 5
 DB_PATH = Path("penny_basing.db").resolve()
 LIVE_STATE_PATH = Path(os.getenv("LIVE_STATE_FILE", "live_trader_state.json")).resolve()
 
+
+def _read_live_state_positions() -> dict[str, int]:
+    if not LIVE_STATE_PATH.exists():
+        return {}
+    try:
+        data = json.loads(LIVE_STATE_PATH.read_text())
+    except Exception as exc:
+        st.warning(f"Failed to read live state: {exc}")
+        return {}
+
+    positions = data.get("positions", {}) or {}
+    cleaned: dict[str, int] = {}
+    for symbol, qty in positions.items():
+        try:
+            cleaned[str(symbol)] = int(qty)
+        except Exception:
+            continue
+    return cleaned
+
 def init_db():
     try:
         with closing(sqlite3.connect(str(DB_PATH))) as conn:
@@ -37,6 +56,14 @@ init_db()
 
 st.set_page_config(page_title="Penny Basing", layout="wide")
 
+# Track the UI start time so we can limit output to this session
+if "start_timestamp" not in st.session_state:
+    st.session_state["start_timestamp"] = time_module.time()
+
+# Capture the live position snapshot present when the UI booted
+if "live_position_baseline" not in st.session_state:
+    st.session_state["live_position_baseline"] = _read_live_state_positions()
+
 # ===================== STYLING =====================
 
 st.markdown(
@@ -59,10 +86,16 @@ st.markdown(
 
 # ===================== DATA LOADERS =====================
 
-def load_alerts() -> pd.DataFrame:
+def load_alerts(min_timestamp: float | None = None) -> pd.DataFrame:
     try:
         with closing(sqlite3.connect(str(DB_PATH))) as conn:
-            df = pd.read_sql_query("SELECT * FROM alerts ORDER BY timestamp DESC", conn)
+            query = "SELECT * FROM alerts"
+            params = ()
+            if min_timestamp is not None:
+                query += " WHERE timestamp >= ?"
+                params = (min_timestamp,)
+            query += " ORDER BY timestamp DESC"
+            df = pd.read_sql_query(query, conn, params=params)
     except Exception as exc:
         st.warning(f"DB error: {exc}")
         return pd.DataFrame()
@@ -77,10 +110,15 @@ def load_alerts() -> pd.DataFrame:
     return df
 
 
-def load_paper_positions() -> pd.DataFrame:
+def load_paper_positions(min_entry_time: float | None = None) -> pd.DataFrame:
     try:
         with closing(sqlite3.connect(str(DB_PATH))) as conn:
-            df = pd.read_sql_query("SELECT * FROM paper_positions", conn)
+            query = "SELECT * FROM paper_positions"
+            params = ()
+            if min_entry_time is not None:
+                query += " WHERE entry_time >= ?"
+                params = (min_entry_time,)
+            df = pd.read_sql_query(query, conn, params=params)
     except Exception:
         return pd.DataFrame()
     return df
@@ -108,18 +146,20 @@ def _latest_prices(symbols: list[str]) -> dict[str, float]:
     return dict(zip(df["symbol"], df["price"]))
 
 
-def load_live_positions() -> pd.DataFrame:
-    if not LIVE_STATE_PATH.exists():
-        return pd.DataFrame()
-    try:
-        data = json.loads(LIVE_STATE_PATH.read_text())
-    except Exception as exc:
-        st.warning(f"Failed to read live state: {exc}")
-        return pd.DataFrame()
-
-    positions = data.get("positions", {}) or {}
+def load_live_positions(baseline: dict[str, int] | None = None) -> pd.DataFrame:
+    positions = _read_live_state_positions()
     if not positions:
         return pd.DataFrame()
+
+    if baseline:
+        adjusted: dict[str, int] = {}
+        for symbol, qty in positions.items():
+            delta = qty - baseline.get(symbol, 0)
+            if delta != 0:
+                adjusted[symbol] = delta
+        positions = adjusted
+        if not positions:
+            return pd.DataFrame()
 
     df = pd.DataFrame(
         {
@@ -143,17 +183,7 @@ def load_daily_pnl():
 
 # ===================== LOGBOOK (SESSION) =====================
 
-if "logbook" not in st.session_state:
-    st.session_state["logbook"] = pd.DataFrame()
-
-alerts_df = load_alerts()
-st.session_state["logbook"] = pd.concat([alerts_df, st.session_state["logbook"]], ignore_index=True)
-st.session_state["logbook"] = (
-    st.session_state["logbook"]
-    .drop_duplicates(subset=["timestamp", "symbol"])
-    .sort_values("timestamp", ascending=False)
-    .reset_index(drop=True)
-)
+alerts_df = load_alerts(st.session_state["start_timestamp"])
 
 # ===================== LATEST ALERTS HEADER =====================
 
@@ -203,9 +233,9 @@ with positions_col:
     )
 
     if position_source == "Paper trader":
-        positions_df = load_paper_positions()
+        positions_df = load_paper_positions(st.session_state["start_timestamp"])
     else:
-        positions_df = load_live_positions()
+        positions_df = load_live_positions(st.session_state["live_position_baseline"])
 
     if positions_df.empty:
         st.info("No positions.")
@@ -248,7 +278,7 @@ with positions_col:
 with logbook_col:
     st.markdown("### Alert Log")
 
-    logbook_df = st.session_state["logbook"]
+    logbook_df = alerts_df
 
     if not logbook_df.empty:
         show = logbook_df[["timestamp", "symbol", "direction", "price"]].copy()
