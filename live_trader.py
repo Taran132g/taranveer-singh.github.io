@@ -215,6 +215,7 @@ class LiveTrader:
         self.positions: Dict[str, int] = {}
         self.last_alert_id = 0
         self.trade_timestamps: list[float] = []
+        self.pending_orders: Dict[str, Dict[str, object]] = {}
 
         self._load_state()
         self._init_db_schema()
@@ -299,6 +300,26 @@ class LiveTrader:
     # ------------------------------------------------------------------
     # Position bookkeeping
     # ------------------------------------------------------------------
+    def _pending_delta(self, symbol: str) -> int:
+        delta = 0
+        for order in self.pending_orders.values():
+            if order.get("symbol") != symbol:
+                continue
+            side = str(order.get("side", "")).upper()
+            qty = int(order.get("qty", 0))
+            delta += qty if side in {"BUY", "COVER"} else -qty
+        return delta
+
+    def _has_pending_orders(self, symbol: str) -> bool:
+        return any(order.get("symbol") == symbol for order in self.pending_orders.values())
+
+    def _add_pending_order(self, order_id: str, *, symbol: str, side: str, qty: int) -> None:
+        self.pending_orders[order_id] = {"symbol": symbol, "side": side.upper(), "qty": qty}
+
+    def _remove_pending_order(self, order_id: Optional[str]) -> None:
+        if order_id and order_id in self.pending_orders:
+            self.pending_orders.pop(order_id, None)
+
     def _apply_position_delta(self, symbol: str, delta: int) -> None:
         new_qty = self.positions.get(symbol, 0) + delta
         if new_qty == 0:
@@ -394,7 +415,9 @@ class LiveTrader:
             )
             order_id = result.get("order_id")
             if order_id:
+                self._add_pending_order(order_id, symbol=symbol, side=side, qty=qty)
                 self._poll_limit_fill(order_id=order_id, symbol=symbol, side=side, qty=qty)
+                self._remove_pending_order(order_id)
             else:
                 LOGGER.warning("No order_id returned for limit order; cannot poll for fills")
         self._record_order(
@@ -487,10 +510,19 @@ class LiveTrader:
             self._engage_emergency_shutdown("Kill switch activated")
 
     def _handle_alert(self, alert_id: int, symbol: str, direction: str, price: float) -> None:
+        if self._has_pending_orders(symbol):
+            LOGGER.info(
+                "Pending order exists for %s; skipping alert %s until it resolves",
+                symbol,
+                alert_id,
+            )
+            return
+
         position = self.positions.get(symbol, 0)
+        projected_position = position + self._pending_delta(symbol)
 
         if direction == "ask-heavy":
-            if position < 0:
+            if projected_position < 0:
                 return
             if position > 0:
                 flattened = self._submit_order(
@@ -508,16 +540,19 @@ class LiveTrader:
                         alert_id,
                     )
                     return
-            self._submit_order(
-                alert_id=alert_id,
-                symbol=symbol,
-                direction=direction,
-                side="SHORT",
-                qty=self.short_size,
-                price=price,
-            )
+            if projected_position == 0:
+                self._submit_order(
+                    alert_id=alert_id,
+                    symbol=symbol,
+                    direction=direction,
+                    side="SHORT",
+                    qty=self.short_size,
+                    price=price,
+                )
+            else:
+                LOGGER.info("Skipping SHORT because pending exposure remains on %s (projected %s)", symbol, projected_position)
         elif direction == "bid-heavy":
-            if position > 0:
+            if projected_position > 0:
                 return
             if position < 0:
                 flattened = self._submit_order(
@@ -535,14 +570,17 @@ class LiveTrader:
                         alert_id,
                     )
                     return
-            self._submit_order(
-                alert_id=alert_id,
-                symbol=symbol,
-                direction=direction,
-                side="BUY",
-                qty=self.position_size,
-                price=price,
-            )
+            if projected_position == 0:
+                self._submit_order(
+                    alert_id=alert_id,
+                    symbol=symbol,
+                    direction=direction,
+                    side="BUY",
+                    qty=self.position_size,
+                    price=price,
+                )
+            else:
+                LOGGER.info("Skipping BUY because pending exposure remains on %s (projected %s)", symbol, projected_position)
 
     def run(self) -> None:
         LOGGER.info("Monitoring alerts from %s (poll %.1fs)", self.db_path, self.poll_interval)
