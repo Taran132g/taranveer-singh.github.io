@@ -48,20 +48,25 @@ $PYTHON_BIN -u paper_trader.py > "$PAPER_LOG" 2>&1 &
 PAPER_PID=$!
 echo " • paper_trader.py → $PAPER_LOG"
 
-echo "[4/5] Starting live_trader.py..."
+RUN_STANDALONE_LIVE=${RUN_STANDALONE_LIVE:-0}
+if [[ "$RUN_STANDALONE_LIVE" == "1" ]]; then
+    echo "[4/5] Starting live_trader.py (standalone fallback)..."
 
-# -------- CRITICAL FIX --------
-# ALWAYS initialize before referencing
-LIVE_ARGS=()
-if [[ "$LIVE_DRY_RUN" == "1" ]]; then
-    LIVE_ARGS+=( "--dry-run" )
-    echo " • live_trader in DRY-RUN mode (NO REAL ORDERS)"
+    # -------- CRITICAL FIX --------
+    # ALWAYS initialize before referencing
+    LIVE_ARGS=()
+    if [[ "$LIVE_DRY_RUN" == "1" ]]; then
+        LIVE_ARGS+=( "--dry-run" )
+        echo " • live_trader in DRY-RUN mode (NO REAL ORDERS)"
+    fi
+    # --------------------------------
+
+    $PYTHON_BIN -u live_trader.py "${LIVE_ARGS[@]}" > "$LIVE_LOG" 2>&1 &
+    LIVE_PID=$!
+    echo " • live_trader.py → $LIVE_LOG"
+else
+    echo "[4/5] Skipping standalone live_trader; inline dispatch in grok.py handles orders"
 fi
-# --------------------------------
-
-$PYTHON_BIN -u live_trader.py "${LIVE_ARGS[@]}" > "$LIVE_LOG" 2>&1 &
-LIVE_PID=$!
-echo " • live_trader.py → $LIVE_LOG"
 
 echo "[5/5] Starting UI..."
 $PYTHON_BIN -m streamlit run ui.py \
