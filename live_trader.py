@@ -120,6 +120,44 @@ class SchwabOrderExecutor:
             raise ValueError(f"Unsupported side '{side}'") from exc
         return self._send(builder, symbol=symbol, side=side.upper(), qty=qty)
 
+    def submit_limit(self, *, symbol: str, qty: int, side: str, limit_price: float) -> Dict[str, Optional[str]]:
+        builders = {
+            "BUY": equity_orders.equity_buy_limit,
+            "SELL": equity_orders.equity_sell_limit,
+            "SHORT": equity_orders.equity_sell_short_limit,
+            "COVER": equity_orders.equity_buy_to_cover_limit,
+        }
+        try:
+            builder_factory = builders[side.upper()]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported side '{side}'") from exc
+
+        try:
+            builder = builder_factory(symbol, limit_price, qty)
+        except TypeError:
+            builder = builder_factory(symbol=symbol, price=limit_price, quantity=qty)
+        return self._send(builder, symbol=symbol, side=side.upper(), qty=qty)
+
+    def cancel_all_orders(self) -> bool:
+        """Attempt to cancel all open orders on the account."""
+
+        if self.dry_run:
+            LOGGER.info("[DRY-RUN] Skip cancel_all_orders")
+            return True
+
+        cancel_all = getattr(self.client, "cancel_all_orders", None)
+        if cancel_all is None:
+            LOGGER.warning("Schwab client does not expose cancel_all_orders; skipping")
+            return False
+
+        try:
+            cancel_all(self.account_id)
+            LOGGER.info("Cancel-all request sent")
+            return True
+        except Exception as exc:  # pragma: no cover - network interaction
+            LOGGER.error("Failed to cancel all orders: %s", exc)
+            return False
+
 
 class LiveTrader:
     """Flip-only alert monitor that places Schwab orders."""
@@ -132,8 +170,12 @@ class LiveTrader:
         self.state_path = Path(os.getenv("LIVE_STATE_FILE", "live_trader_state.json"))
         self.executor = SchwabOrderExecutor(dry_run=dry_run)
         self.dry_run = self.executor.dry_run
+        self.prefer_limit_orders = _bool_env("LIVE_PREFER_LIMIT_ORDERS", True)
+        self.kill_switch_path = Path(os.getenv("LIVE_KILL_SWITCH_FILE", "kill_switch.flag"))
+        self.max_trades_per_hour = int(os.getenv("LIVE_MAX_TRADES_PER_HOUR", "60"))
         self.positions: Dict[str, int] = {}
         self.last_alert_id = 0
+        self.trade_timestamps: list[float] = []
 
         self._load_state()
         self._init_db_schema()
@@ -205,6 +247,16 @@ class LiveTrader:
             row = cur.fetchone()
             return int(row[0]) if row and row[0] else 0
 
+    def _latest_price(self, symbol: str) -> Optional[float]:
+        with self._open_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT price FROM alerts WHERE symbol=? ORDER BY rowid DESC LIMIT 1",
+                (symbol,),
+            )
+            row = cur.fetchone()
+            return float(row[0]) if row else None
+
     # ------------------------------------------------------------------
     # Position bookkeeping
     # ------------------------------------------------------------------
@@ -245,8 +297,30 @@ class LiveTrader:
             )
             conn.commit()
 
-    def _submit_order(self, *, alert_id: int, symbol: str, direction: str, side: str, qty: int, price: float) -> bool:
-        result = self.executor.submit_market(symbol=symbol, qty=qty, side=side)
+    def _submit_order(
+        self,
+        *,
+        alert_id: int,
+        symbol: str,
+        direction: str,
+        side: str,
+        qty: int,
+        price: float,
+        force_market: bool = False,
+    ) -> bool:
+        use_limit = self.prefer_limit_orders and not force_market
+        if use_limit:
+            result = self.executor.submit_limit(symbol=symbol, qty=qty, side=side, limit_price=price)
+            if result.get("error"):
+                LOGGER.warning(
+                    "Limit order for %s %s failed (%s); falling back to market as emergency",
+                    side,
+                    symbol,
+                    result.get("error"),
+                )
+                result = self.executor.submit_market(symbol=symbol, qty=qty, side=side)
+        else:
+            result = self.executor.submit_market(symbol=symbol, qty=qty, side=side)
         success = result.get("error") is None and (
             result.get("dry_run")
             or (
@@ -267,7 +341,50 @@ class LiveTrader:
             price=price,
             result=result,
         )
+        if success:
+            self.trade_timestamps.append(time.time())
+            self._enforce_trade_rate_limit()
         return success
+
+    def _enforce_trade_rate_limit(self) -> None:
+        cutoff = time.time() - 3600
+        self.trade_timestamps = [ts for ts in self.trade_timestamps if ts >= cutoff]
+        if len(self.trade_timestamps) > self.max_trades_per_hour:
+            LOGGER.error(
+                "Trade rate exceeded limit (%s in the last hour); engaging kill switch",
+                len(self.trade_timestamps),
+            )
+            self._engage_emergency_shutdown("Trade-per-hour limit exceeded")
+
+    def _engage_emergency_shutdown(self, reason: str) -> None:
+        LOGGER.error("EMERGENCY STOP: %s", reason)
+        try:
+            self.executor.cancel_all_orders()
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.warning("Failed to request cancel-all: %s", exc)
+
+        for symbol, qty in list(self.positions.items()):
+            if qty == 0:
+                continue
+            side = "SELL" if qty > 0 else "COVER"
+            price = self._latest_price(symbol) or 0.0
+            self._submit_order(
+                alert_id=-1,
+                symbol=symbol,
+                direction="kill-switch",
+                side=side,
+                qty=abs(qty),
+                price=price,
+                force_market=True,
+            )
+
+        self._save_state()
+        raise SystemExit(1)
+
+    def _check_kill_switch(self) -> None:
+        if self.kill_switch_path.exists():
+            LOGGER.error("Kill switch file %s detected", self.kill_switch_path)
+            self._engage_emergency_shutdown("Kill switch activated")
 
     def _handle_alert(self, alert_id: int, symbol: str, direction: str, price: float) -> None:
         position = self.positions.get(symbol, 0)
@@ -330,6 +447,7 @@ class LiveTrader:
     def run(self) -> None:
         LOGGER.info("Monitoring alerts from %s (poll %.1fs)", self.db_path, self.poll_interval)
         while True:
+            self._check_kill_switch()
             with self._open_conn() as conn:
                 cur = conn.cursor()
                 cur.execute(
