@@ -321,17 +321,32 @@ class LiveTrader:
                 result = self.executor.submit_market(symbol=symbol, qty=qty, side=side)
         else:
             result = self.executor.submit_market(symbol=symbol, qty=qty, side=side)
-        success = result.get("error") is None and (
+
+        submitted = result.get("error") is None and (
             result.get("dry_run")
             or (
                 result.get("status_code") not in {None, ""}
                 and str(result.get("status_code")).startswith("2")
             )
         )
-        if success and not result.get("dry_run"):
+
+        filled_immediately = submitted and (
+            result.get("dry_run")
+            or not use_limit
+        )
+
+        if filled_immediately and not result.get("dry_run"):
             delta = qty if side in {"BUY", "COVER"} else -qty
             self._apply_position_delta(symbol, delta)
             self._save_state()
+        elif submitted and use_limit:
+            LOGGER.info(
+                "Limit order accepted for %s %s %s at %s; awaiting fill before updating positions",
+                side,
+                qty,
+                symbol,
+                price,
+            )
         self._record_order(
             alert_id=alert_id,
             symbol=symbol,
@@ -341,10 +356,10 @@ class LiveTrader:
             price=price,
             result=result,
         )
-        if success:
+        if filled_immediately:
             self.trade_timestamps.append(time.time())
             self._enforce_trade_rate_limit()
-        return success
+        return submitted
 
     def _enforce_trade_rate_limit(self) -> None:
         cutoff = time.time() - 3600
