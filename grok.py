@@ -62,6 +62,12 @@ def _get_int_env(name: str, default: int, minimum: int = 1) -> int:
         return max(default, minimum)
     return max(val, minimum)
 
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
 def _get_float_env(name: str, default: float, minimum: float = 0.0) -> float:
     raw = os.getenv(name)
     if raw is None or raw == "":
@@ -320,6 +326,7 @@ _chart_debug_remaining: Dict[str, int] = defaultdict(lambda: 10)
 _timesale_debug_remaining: Dict[str, int] = defaultdict(lambda: 10)
 _last_chart_or_timesale_ts: Dict[str, float] = defaultdict(float)
 _last_volume_fallback_ts: Dict[str, float] = defaultdict(float)
+inline_trader_dispatch = None
 
 @dataclass
 class Trade:
@@ -609,6 +616,7 @@ def on_book(msg: dict):
                     (alert["timestamp"], alert["symbol"], alert["ratio"], alert["total_bids"],
                      alert["total_asks"], alert["heavy_venues"], alert["direction"], alert["price"])
                 )
+                alert_id = c.lastrowid
                 conn.commit()
                 last_alert[sym] = now
                 log_structured("ALERT", {
@@ -622,6 +630,8 @@ def on_book(msg: dict):
                     "vol_per_min": round(vol_per_min, 2),
                     "imbalance_duration": round(imbalance_duration, 2)
                 })
+                if inline_trader_dispatch:
+                    inline_trader_dispatch(alert_id, alert)
 
 async def resolve_exchange(client: Client, sym: str) -> Optional[str]:
     if sym in exchange_cache:
@@ -732,6 +742,7 @@ async def main():
     MIN_VOLUME = args.min_volume if args.min_volume is not None else _get_int_env("MIN_VOLUME", 100000, 1000)
     MIN_IMBALANCE_DURATION_SEC = args.min_imbalance_duration if args.min_imbalance_duration is not None else _get_float_env("MIN_IMBALANCE_DURATION_SEC", 10.0, 0.0)
     DB_PATH = args.db_path if args.db_path is not None else os.getenv("DB_PATH", "penny_basing.db")
+    os.environ["DB_PATH"] = str(DB_PATH)
     # if args.symbols:
     #     SYMBOLS = [s.strip().upper() for s in args.symbols.replace(" ", ",").split(",") if s.strip()]
     # else:
@@ -774,6 +785,33 @@ async def main():
             )
         ''')
     conn.commit()
+
+    global inline_trader_dispatch
+    inline_trader_dispatch = None
+    try:
+        from live_trader import LiveTrader
+
+        inline_trader = LiveTrader(dry_run=_bool_env("INLINE_LIVE_DRY_RUN", False))
+        loop = asyncio.get_running_loop()
+
+        def inline_trader_dispatch(alert_id: int, alert: dict) -> None:
+            asyncio.create_task(
+                loop.run_in_executor(
+                    None,
+                    inline_trader.process_alert,
+                    int(alert_id),
+                    alert["symbol"],
+                    alert["direction"],
+                    float(alert["price"]),
+                )
+            )
+
+        log_structured(
+            "INLINE_TRADER",
+            {"status": "enabled", "dry_run": inline_trader.dry_run},
+        )
+    except Exception as exc:
+        log_structured("INLINE_TRADER_ERROR", {"error": str(exc)})
 
     try:
         client = easy_client(api_key=api_key, app_secret=app_secret,

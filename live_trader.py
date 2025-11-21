@@ -15,12 +15,13 @@ import logging
 import os
 import sqlite3
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Dict, Optional
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
-from grok import _normalize_and_validate_callback
 from schwab.auth import easy_client
 from schwab.orders import equities as equity_orders
 
@@ -35,6 +36,17 @@ def _require_env(name: str) -> str:
     if not value:
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
+
+
+def _normalize_and_validate_callback(url: str) -> str:
+    if not url:
+        raise ValueError("SCHWAB_REDIRECT_URI is empty")
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(
+            f"Invalid SCHWAB_REDIRECT_URI '{url}'. Expected full URL like 'https://127.0.0.1:8182/'."
+        )
+    return url if url.endswith("/") else url + "/"
 
 
 def _bool_env(name: str, default: bool = False) -> bool:
@@ -107,6 +119,43 @@ class SchwabOrderExecutor:
 
         return result
 
+    def fetch_order_status(self, order_id: str) -> Dict[str, Optional[str]]:
+        result: Dict[str, Optional[str]] = {"order_id": order_id, "status": None, "error": None}
+
+        if self.dry_run:
+            result["status"] = "FILLED"
+            result["dry_run"] = True
+            return result
+
+        fetch_order = getattr(self.client, "get_order", None)
+        if fetch_order is None:
+            result["error"] = "Schwab client does not expose get_order"
+            return result
+
+        try:
+            response = fetch_order(self.account_id, order_id)
+        except Exception as exc:  # pragma: no cover - network interaction
+            LOGGER.error("Failed to fetch order %s: %s", order_id, exc)
+            result["error"] = str(exc)
+            return result
+
+        result["status_code"] = str(getattr(response, "status_code", None))
+        try:
+            payload = response.json() if hasattr(response, "json") else None
+        except Exception:
+            payload = None
+
+        if isinstance(payload, dict):
+            status = payload.get("status") or payload.get("orderStatus") or payload.get("order_status")
+            filled_qty = payload.get("filledQuantity") or payload.get("filled_quantity")
+            result["status"] = status
+            result["filled_quantity"] = filled_qty
+            result["raw"] = payload
+        else:
+            result["raw"] = str(payload)
+
+        return result
+
     def submit_market(self, *, symbol: str, qty: int, side: str) -> Dict[str, Optional[str]]:
         builders = {
             "BUY": equity_orders.equity_buy_market,
@@ -115,10 +164,53 @@ class SchwabOrderExecutor:
             "COVER": equity_orders.equity_buy_to_cover_market,
         }
         try:
-            builder = builders[side.upper()](symbol, qty)
+            builder_factory = builders[side.upper()]
         except KeyError as exc:
             raise ValueError(f"Unsupported side '{side}'") from exc
+
+        try:
+            builder = builder_factory(symbol, qty)
+        except TypeError:
+            builder = builder_factory(symbol=symbol, quantity=qty)
         return self._send(builder, symbol=symbol, side=side.upper(), qty=qty)
+
+    def submit_limit(self, *, symbol: str, qty: int, side: str, limit_price: float) -> Dict[str, Optional[str]]:
+        builders = {
+            "BUY": equity_orders.equity_buy_limit,
+            "SELL": equity_orders.equity_sell_limit,
+            "SHORT": equity_orders.equity_sell_short_limit,
+            "COVER": equity_orders.equity_buy_to_cover_limit,
+        }
+        try:
+            builder_factory = builders[side.upper()]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported side '{side}'") from exc
+
+        try:
+            builder = builder_factory(symbol, limit_price, qty)
+        except TypeError:
+            builder = builder_factory(symbol=symbol, price=limit_price, quantity=qty)
+        return self._send(builder, symbol=symbol, side=side.upper(), qty=qty)
+
+    def cancel_all_orders(self) -> bool:
+        """Attempt to cancel all open orders on the account."""
+
+        if self.dry_run:
+            LOGGER.info("[DRY-RUN] Skip cancel_all_orders")
+            return True
+
+        cancel_all = getattr(self.client, "cancel_all_orders", None)
+        if cancel_all is None:
+            LOGGER.warning("Schwab client does not expose cancel_all_orders; skipping")
+            return False
+
+        try:
+            cancel_all(self.account_id)
+            LOGGER.info("Cancel-all request sent")
+            return True
+        except Exception as exc:  # pragma: no cover - network interaction
+            LOGGER.error("Failed to cancel all orders: %s", exc)
+            return False
 
 
 class LiveTrader:
@@ -132,8 +224,15 @@ class LiveTrader:
         self.state_path = Path(os.getenv("LIVE_STATE_FILE", "live_trader_state.json"))
         self.executor = SchwabOrderExecutor(dry_run=dry_run)
         self.dry_run = self.executor.dry_run
+        self.prefer_limit_orders = _bool_env("LIVE_PREFER_LIMIT_ORDERS", True)
+        self.kill_switch_path = Path(os.getenv("LIVE_KILL_SWITCH_FILE", "kill_switch.flag"))
+        self.max_trades_per_hour = int(os.getenv("LIVE_MAX_TRADES_PER_HOUR", "60"))
+        self.limit_fill_timeout = float(os.getenv("LIVE_LIMIT_FILL_TIMEOUT", "60"))
+        self.limit_fill_poll_interval = float(os.getenv("LIVE_LIMIT_FILL_POLL_INTERVAL", "2"))
         self.positions: Dict[str, int] = {}
         self.last_alert_id = 0
+        self.trade_timestamps: list[float] = []
+        self._lock = threading.Lock()
 
         self._load_state()
         self._init_db_schema()
@@ -205,6 +304,16 @@ class LiveTrader:
             row = cur.fetchone()
             return int(row[0]) if row and row[0] else 0
 
+    def _latest_price(self, symbol: str) -> Optional[float]:
+        with self._open_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT price FROM alerts WHERE symbol=? ORDER BY rowid DESC LIMIT 1",
+                (symbol,),
+            )
+            row = cur.fetchone()
+            return float(row[0]) if row else None
+
     # ------------------------------------------------------------------
     # Position bookkeeping
     # ------------------------------------------------------------------
@@ -215,6 +324,95 @@ class LiveTrader:
         else:
             self.positions[symbol] = new_qty
         LOGGER.info("Position update %s => %s", symbol, new_qty)
+
+    def _record_fill(self, *, symbol: str, side: str, qty: int) -> None:
+        delta = qty if side in {"BUY", "COVER"} else -qty
+        self._apply_position_delta(symbol, delta)
+        if not self.dry_run:
+            self._save_state()
+        self.trade_timestamps.append(time.time())
+        self._enforce_trade_rate_limit()
+
+    # ------------------------------------------------------------------
+    # Order + alert processing
+    # ------------------------------------------------------------------
+    def _poll_limit_fill(self, *, order_id: str, symbol: str, side: str, qty: int) -> bool:
+        start = time.time()
+        deadline = start + self.limit_fill_timeout
+        last_status: Optional[str] = None
+
+        while time.time() < deadline:
+            status = self.executor.fetch_order_status(order_id)
+            last_status = (status.get("status") or "").upper()
+
+            if status.get("error"):
+                LOGGER.warning(
+                    "Unable to poll order %s for %s %s %s: %s",
+                    order_id,
+                    side,
+                    qty,
+                    symbol,
+                    status.get("error"),
+                )
+                break
+
+            if last_status in {"FILLED", "FILLED_ALL", "FILLED_ALL_SHARES"}:
+                LOGGER.info("Limit order %s filled for %s %s %s", order_id, side, qty, symbol)
+                self._record_fill(symbol=symbol, side=side, qty=qty)
+                return True
+
+            if last_status in {"CANCELED", "REJECTED", "EXPIRED"}:
+                LOGGER.warning("Limit order %s ended with status %s", order_id, last_status)
+                return False
+
+            time.sleep(self.limit_fill_poll_interval)
+
+        LOGGER.warning(
+            "Timed out waiting for limit order %s to fill (last_status=%s)",
+            order_id,
+            last_status,
+        )
+        return False
+
+    def _enforce_trade_rate_limit(self) -> None:
+        cutoff = time.time() - 3600
+        self.trade_timestamps = [ts for ts in self.trade_timestamps if ts >= cutoff]
+        if len(self.trade_timestamps) > self.max_trades_per_hour:
+            LOGGER.error(
+                "Trade rate exceeded limit (%s in the last hour); engaging kill switch",
+                len(self.trade_timestamps),
+            )
+            self._engage_emergency_shutdown("Trade-per-hour limit exceeded")
+
+    def _engage_emergency_shutdown(self, reason: str) -> None:
+        LOGGER.error("EMERGENCY STOP: %s", reason)
+        try:
+            self.executor.cancel_all_orders()
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.warning("Failed to request cancel-all: %s", exc)
+
+        for symbol, qty in list(self.positions.items()):
+            if qty == 0:
+                continue
+            side = "SELL" if qty > 0 else "COVER"
+            price = self._latest_price(symbol) or 0.0
+            self._submit_order(
+                alert_id=-1,
+                symbol=symbol,
+                direction="kill-switch",
+                side=side,
+                qty=abs(qty),
+                price=price,
+                force_market=True,
+            )
+
+        self._save_state()
+        raise SystemExit(1)
+
+    def _check_kill_switch(self) -> None:
+        if self.kill_switch_path.exists():
+            LOGGER.error("Kill switch file %s detected", self.kill_switch_path)
+            self._engage_emergency_shutdown("Kill switch activated")
 
     # ------------------------------------------------------------------
     # Order + alert processing
@@ -245,19 +443,69 @@ class LiveTrader:
             )
             conn.commit()
 
-    def _submit_order(self, *, alert_id: int, symbol: str, direction: str, side: str, qty: int, price: float) -> bool:
-        result = self.executor.submit_market(symbol=symbol, qty=qty, side=side)
-        success = result.get("error") is None and (
+    def _submit_order(
+        self,
+        *,
+        alert_id: int,
+        symbol: str,
+        direction: str,
+        side: str,
+        qty: int,
+        price: float,
+        force_market: bool = False,
+    ) -> bool:
+        use_limit = self.prefer_limit_orders and not force_market
+        result = self.executor.submit_limit(symbol=symbol, qty=qty, side=side, limit_price=price) if use_limit else None
+        if use_limit and result and result.get("error"):
+            LOGGER.warning(
+                "Limit order for %s %s failed (%s); falling back to market as emergency",
+                side,
+                symbol,
+                result.get("error"),
+            )
+            use_limit = False
+            result = None
+
+        if result is None:
+            result = self.executor.submit_market(symbol=symbol, qty=qty, side=side)
+
+        submitted = result.get("error") is None and (
             result.get("dry_run")
             or (
                 result.get("status_code") not in {None, ""}
                 and str(result.get("status_code")).startswith("2")
             )
         )
-        if success and not result.get("dry_run"):
-            delta = qty if side in {"BUY", "COVER"} else -qty
-            self._apply_position_delta(symbol, delta)
-            self._save_state()
+
+        filled = False
+        fill_status: Optional[str] = None
+
+        if submitted:
+            if result.get("dry_run") or not use_limit:
+                self._record_fill(symbol=symbol, side=side, qty=qty)
+                filled = True
+                fill_status = "FILLED"
+            else:
+                order_id = result.get("order_id")
+                if not order_id:
+                    LOGGER.warning("No order_id returned for limit order; cannot poll for fills")
+                    fill_status = "FAILED"
+                else:
+                    LOGGER.info(
+                        "Limit order accepted for %s %s %s at %s; awaiting fill",
+                        side,
+                        qty,
+                        symbol,
+                        price,
+                    )
+                    poll_success = self._poll_limit_fill(order_id=order_id, symbol=symbol, side=side, qty=qty)
+                    filled = poll_success
+                    fill_status = "FILLED" if poll_success else "FAILED"
+        else:
+            fill_status = "FAILED"
+
+        result["fill_status"] = fill_status
+
         self._record_order(
             alert_id=alert_id,
             symbol=symbol,
@@ -267,7 +515,7 @@ class LiveTrader:
             price=price,
             result=result,
         )
-        return success
+        return filled
 
     def _handle_alert(self, alert_id: int, symbol: str, direction: str, price: float) -> None:
         position = self.positions.get(symbol, 0)
@@ -327,9 +575,49 @@ class LiveTrader:
                 price=price,
             )
 
+    def process_alert(
+        self,
+        alert_id: int,
+        symbol: str,
+        direction: str,
+        price: float,
+        *,
+        persist_state: bool = True,
+    ) -> None:
+        """Process a single alert, optionally persisting state immediately.
+
+        This entry point lets ``grok.py`` dispatch alerts inline without
+        waiting for the polling loop, while keeping the standalone ``run``
+        method available for tailing the DB.
+        """
+        with self._lock:
+            self.last_alert_id = max(self.last_alert_id, int(alert_id))
+            self._handle_alert(alert_id, symbol, direction, price)
+            if persist_state and not self.dry_run:
+                self._save_state()
+
     def run(self) -> None:
-        LOGGER.info("Monitoring alerts from %s (poll %.1fs)", self.db_path, self.poll_interval)
+        # Keep the hot path responsive: when alerts are flowing we poll on a
+        # ~50ms cadence. During lulls we exponentially back off to avoid hot
+        # loops, but we watch for DB file writes every 10ms so a new alert can
+        # break the longer sleep immediately. This mirrors the low-latency
+        # monitoring used in ``paper_trader``.
+        min_sleep = 0.05
+        mtime_probe = 0.01
+        max_sleep = max(self.poll_interval, 2.0)
+        idle_sleep = min_sleep
+        db_path = self.db_path
+        last_db_mtime = db_path.stat().st_mtime if db_path.exists() else 0.0
+
+        LOGGER.info(
+            "Monitoring alerts from %s (adaptive poll %.0fms–%.1fs)",
+            db_path,
+            min_sleep * 1000,
+            max_sleep,
+        )
+
         while True:
+            self._check_kill_switch()
             with self._open_conn() as conn:
                 cur = conn.cursor()
                 cur.execute(
@@ -344,17 +632,43 @@ class LiveTrader:
                 rows = cur.fetchall()
 
             for row in rows:
-                alert_id = int(row["rowid"])
-                symbol = row["symbol"]
-                direction = row["direction"]
-                price = float(row["price"])
-                self.last_alert_id = alert_id
-                self._handle_alert(alert_id, symbol, direction, price)
+                self.process_alert(
+                    int(row["rowid"]),
+                    row["symbol"],
+                    row["direction"],
+                    float(row["price"]),
+                    persist_state=False,
+                )
 
             if rows and not self.dry_run:
                 self._save_state()
 
-            time.sleep(self.poll_interval)
+            activity_detected = bool(rows)
+            db_mtime_snapshot = db_path.stat().st_mtime if db_path.exists() else last_db_mtime
+
+            if activity_detected:
+                idle_sleep = min_sleep
+                last_db_mtime = db_mtime_snapshot
+                time.sleep(idle_sleep)
+                continue
+
+            target_sleep = min(idle_sleep * 2, max_sleep)
+            wake_deadline = time.monotonic() + target_sleep
+            woke_for_write = False
+
+            while time.monotonic() < wake_deadline:
+                time.sleep(mtime_probe)
+                current_mtime = db_path.stat().st_mtime if db_path.exists() else 0.0
+                if current_mtime != db_mtime_snapshot:
+                    woke_for_write = True
+                    db_mtime_snapshot = current_mtime
+                    break
+
+            last_db_mtime = db_mtime_snapshot
+            idle_sleep = min_sleep if woke_for_write else target_sleep
+
+            if woke_for_write:
+                continue
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
