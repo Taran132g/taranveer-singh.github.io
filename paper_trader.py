@@ -262,8 +262,11 @@ class PaperTrader:
     def monitor_alerts(self):
         print("[PAPER] Monitoring alerts (Flip-Only Mode)…", flush=True)
 
-        min_sleep = 0.05   # 50ms: fast reaction when alerts are flowing
-        max_sleep = 2.0    # back off to 2s when idle to avoid hot loops
+        # Sleep is adaptive: immediately after seeing alerts we use the 50ms
+        # minimum to react quickly; consecutive empty polls double the wait
+        # time up to a 2s ceiling to avoid hot loops when idle.
+        min_sleep = 0.05   # fast reaction when alerts are flowing
+        max_sleep = 2.0    # back off to 2s when idle
         idle_sleep = min_sleep
 
         while True:
@@ -303,11 +306,13 @@ class PaperTrader:
                 # Update current price and PnL even when no trade is executed
                 self._update_position_db(symbol, cur_price=price)
 
-            if rows:
-                # Reset sleep interval when we just processed fresh alerts
+            activity_detected = bool(rows)
+
+            if activity_detected:
+                # Fresh alerts observed → use minimum sleep for quick response.
                 idle_sleep = min_sleep
             else:
-                # Exponential backoff while idle (bounded to avoid long pauses)
+                # No alerts observed → back off exponentially up to the ceiling.
                 idle_sleep = min(idle_sleep * 2, max_sleep)
 
             time.sleep(idle_sleep)
