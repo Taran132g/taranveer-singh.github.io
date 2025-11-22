@@ -1,4 +1,9 @@
 # paper_trader.py
+# ----------------
+# Paper (simulated) trader that mirrors the LiveTrader flip-only logic without
+# touching real money. It reads alerts from SQLite, flips between long/short
+# with fixed sizes, and records PnL so you can see how the strategy would have
+# behaved.
 import sqlite3
 import time
 import threading
@@ -262,6 +267,27 @@ class PaperTrader:
     def monitor_alerts(self):
         print("[PAPER] Monitoring alerts (Flip-Only Mode)…", flush=True)
 
+        # Sleep is adaptive: immediately after seeing alerts we use the 50ms
+        # minimum to react quickly; consecutive empty polls (no rows newer
+        # than last_alert_id) double the wait time up to a 2s ceiling to
+        # avoid hot loops when idle. To avoid sleeping through a new alert
+        # that arrives just after a poll, we watch for DB file writes during
+        # the longer idle backoff and wake early when the file mtime changes.
+        # Fast-path latency target when alerts are flowing. Compared to the
+        # original fixed 1s poll, a new alert is usually seen within ~50ms
+        # after activity or ~10ms during idle file-probing.
+        min_sleep = 0.05
+
+        # While idling we probe the DB file mtime on a tighter cadence so a
+        # newly written alert is noticed within ~10ms even if the outer backoff
+        # has grown toward the 2s ceiling.
+        mtime_probe = 0.01
+
+        max_sleep = 2.0    # back off to 2s when idle
+        idle_sleep = min_sleep
+        db_path = Path(DB_PATH)
+        last_db_mtime = db_path.stat().st_mtime if db_path.exists() else 0.0
+
         while True:
             with self._open_conn() as conn:
                 cur = conn.cursor()
@@ -299,7 +325,40 @@ class PaperTrader:
                 # Update current price and PnL even when no trade is executed
                 self._update_position_db(symbol, cur_price=price)
 
-            time.sleep(1)
+            activity_detected = bool(rows)
+
+            # Track DB file changes so we can wake early from long sleeps.
+            db_mtime_snapshot = db_path.stat().st_mtime if db_path.exists() else last_db_mtime
+
+            if activity_detected:
+                # Fresh alerts observed → use minimum sleep for quick response.
+                idle_sleep = min_sleep
+                last_db_mtime = db_mtime_snapshot
+                time.sleep(idle_sleep)
+                continue
+
+            # No alerts observed → back off exponentially up to the ceiling,
+            # but poll the DB mtime every few milliseconds so we can break out
+            # quickly if new alerts are inserted right after the query.
+            target_sleep = min(idle_sleep * 2, max_sleep)
+            wake_deadline = time.monotonic() + target_sleep
+            woke_for_write = False
+
+            while time.monotonic() < wake_deadline:
+                time.sleep(mtime_probe)
+                current_mtime = db_path.stat().st_mtime if db_path.exists() else 0.0
+                if current_mtime != db_mtime_snapshot:
+                    woke_for_write = True
+                    db_mtime_snapshot = current_mtime
+                    break
+
+            last_db_mtime = db_mtime_snapshot
+            idle_sleep = min_sleep if woke_for_write else target_sleep
+
+            # If a write occurred, immediately loop to fetch new alerts; if not,
+            # we've already slept the full backoff duration via the wake loop.
+            if woke_for_write:
+                continue
 
     # ============================================================
     # Start Trader Thread
