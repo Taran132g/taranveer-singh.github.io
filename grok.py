@@ -362,6 +362,8 @@ _last_volume_fallback_ts: Dict[str, float] = defaultdict(float)
 # to LiveTrader in the same process. This keeps latency as low as possible and
 # avoids waiting for a separate polling script.
 inline_trader_dispatch = None
+inline_only_mode: bool = False
+inline_only_next_alert_id: int = 0
 
 @dataclass
 class Trade:
@@ -646,15 +648,25 @@ def on_book(msg: dict):
                 alert_history[sym].append(alert)
                 if len(alert_history[sym]) > 10:
                     alert_history[sym].pop(0)
-                c = conn.cursor()
-                c.execute(
-                    "INSERT INTO alerts (timestamp, symbol, ratio, total_bids, total_asks, heavy_venues, direction, price) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (alert["timestamp"], alert["symbol"], alert["ratio"], alert["total_bids"],
-                     alert["total_asks"], alert["heavy_venues"], alert["direction"], alert["price"])
-                )
-                alert_id = c.lastrowid
-                conn.commit()
+                global inline_only_next_alert_id
+                if inline_only_mode:
+                    inline_only_next_alert_id += 1
+                    next_alert_id = inline_only_next_alert_id
+                else:
+                    c = conn.cursor()
+                    c.execute("SELECT IFNULL(MAX(rowid), 0) FROM alerts")
+                    next_alert_id = (c.fetchone() or [0])[0] + 1
+                if inline_trader_dispatch:
+                    inline_trader_dispatch(next_alert_id, alert)
+                if not inline_only_mode:
+                    c.execute(
+                        "INSERT INTO alerts (rowid, timestamp, symbol, ratio, total_bids, total_asks, heavy_venues, direction, price) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (next_alert_id, alert["timestamp"], alert["symbol"], alert["ratio"], alert["total_bids"],
+                         alert["total_asks"], alert["heavy_venues"], alert["direction"], alert["price"])
+                    )
+                    alert_id = next_alert_id
+                    conn.commit()
                 last_alert[sym] = now
                 log_structured("ALERT", {
                     "symbol": sym,
@@ -667,8 +679,6 @@ def on_book(msg: dict):
                     "vol_per_min": round(vol_per_min, 2),
                     "imbalance_duration": round(imbalance_duration, 2)
                 })
-                if inline_trader_dispatch:
-                    inline_trader_dispatch(alert_id, alert)
 
 async def resolve_exchange(client: Client, sym: str) -> Optional[str]:
     if sym in exchange_cache:
@@ -783,6 +793,7 @@ async def main():
     MIN_IMBALANCE_DURATION_SEC = args.min_imbalance_duration if args.min_imbalance_duration is not None else _get_float_env("MIN_IMBALANCE_DURATION_SEC", 10.0, 0.0)
     DB_PATH = args.db_path if args.db_path is not None else os.getenv("DB_PATH", "penny_basing.db")
     os.environ["DB_PATH"] = str(DB_PATH)
+    inline_only_requested = _bool_env("INLINE_DISPATCH_ONLY", False)
     # if args.symbols:
     #     SYMBOLS = [s.strip().upper() for s in args.symbols.replace(" ", ",").split(",") if s.strip()]
     # else:
@@ -804,7 +815,7 @@ async def main():
     msg_count = {s: 0 for s in SYMBOLS}
 
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    global conn
+    global conn, inline_only_next_alert_id
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("PRAGMA table_info(alerts)")
@@ -824,10 +835,12 @@ async def main():
                 price REAL
             )
         ''')
+    inline_only_next_alert_id = (c.execute("SELECT IFNULL(MAX(rowid), 0) FROM alerts").fetchone() or [0])[0]
     conn.commit()
 
-    global inline_trader_dispatch
+    global inline_trader_dispatch, inline_only_mode
     inline_trader_dispatch = None
+    inline_only_mode = False
     try:
         from live_trader import LiveTrader
 
@@ -846,12 +859,20 @@ async def main():
                 )
             )
 
+        inline_only_mode = inline_only_requested
+        inline_log = {"status": "enabled", "dry_run": inline_trader.dry_run}
+        if inline_only_mode:
+            inline_log["mode"] = "inline_only"
+        log_structured("INLINE_TRADER", inline_log)
+    except Exception as exc:
+        inline_only_mode = False
+        log_structured("INLINE_TRADER_ERROR", {"error": str(exc)})
+
+    if inline_only_requested and not inline_only_mode:
         log_structured(
             "INLINE_TRADER",
-            {"status": "enabled", "dry_run": inline_trader.dry_run},
+            {"status": "inline_only_disabled", "reason": "dispatch unavailable"},
         )
-    except Exception as exc:
-        log_structured("INLINE_TRADER_ERROR", {"error": str(exc)})
 
     try:
         client = easy_client(api_key=api_key, app_secret=app_secret,

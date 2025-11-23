@@ -5,6 +5,11 @@ flip-only logic from ``paper_trader.py`` into real Schwab order requests. By
 default it targets the paperMoney environment: simply point
 ``SCHWAB_ACCOUNT_ID`` at your paper account hash and the script will place
 market orders through the official REST API.
+
+When ``grok.py`` runs inline with :class:`LiveTrader`, alerts never need to hit
+SQLite; they can be delivered directly via the in-process callback. The polling
+loop in this file remains for the cases where you run ``live_trader.py`` as a
+standalone service (e.g., on a different host or to backfill older alerts).
 """
 from __future__ import annotations
 
@@ -232,15 +237,16 @@ class LiveTrader:
     and a kill-switch file.
     """
 
-    def __init__(self, *, dry_run: bool = False) -> None:
+    def __init__(self, *, dry_run: bool = False, executor: Optional[SchwabOrderExecutor] = None) -> None:
         self.db_path = Path(os.getenv("DB_PATH", "penny_basing.db"))
         self.position_size = int(os.getenv("LIVE_POSITION_SIZE", os.getenv("POSITION_SIZE", "5000")))
         self.short_size = int(os.getenv("LIVE_SHORT_SIZE", os.getenv("SHORT_SIZE", str(self.position_size))))
         self.poll_interval = float(os.getenv("LIVE_POLL_INTERVAL", "1"))
         self.state_path = Path(os.getenv("LIVE_STATE_FILE", "live_trader_state.json"))
-        self.executor = SchwabOrderExecutor(dry_run=dry_run)
-        self.dry_run = self.executor.dry_run
+        self.executor = executor if executor is not None else SchwabOrderExecutor(dry_run=dry_run)
+        self.dry_run = getattr(self.executor, "dry_run", dry_run)
         self.prefer_limit_orders = _bool_env("LIVE_PREFER_LIMIT_ORDERS", True)
+        self.limit_slippage_bps = float(os.getenv("LIVE_LIMIT_SLIPPAGE_BPS", "10.0"))
         self.kill_switch_path = Path(os.getenv("LIVE_KILL_SWITCH_FILE", "kill_switch.flag"))
         self.max_trades_per_hour = int(os.getenv("LIVE_MAX_TRADES_PER_HOUR", "60"))
         self.limit_fill_timeout = float(os.getenv("LIVE_LIMIT_FILL_TIMEOUT", "60"))
@@ -293,6 +299,20 @@ class LiveTrader:
             cur = conn.cursor()
             cur.execute(
                 """
+                CREATE TABLE IF NOT EXISTS alerts (
+                    timestamp REAL,
+                    symbol TEXT,
+                    ratio REAL,
+                    total_bids INTEGER,
+                    total_asks INTEGER,
+                    heavy_venues INTEGER,
+                    direction TEXT,
+                    price REAL
+                )
+                """
+            )
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS live_orders (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     alert_rowid INTEGER,
@@ -316,11 +336,15 @@ class LiveTrader:
             self.last_alert_id = self._get_last_alert_id_from_db()
 
     def _get_last_alert_id_from_db(self) -> int:
-        with self._open_conn() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT MAX(rowid) FROM alerts")
-            row = cur.fetchone()
-            return int(row[0]) if row and row[0] else 0
+        try:
+            with self._open_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT MAX(rowid) FROM alerts")
+                row = cur.fetchone()
+                return int(row[0]) if row and row[0] else 0
+        except sqlite3.Error:
+            LOGGER.warning("alerts table missing; starting with last_alert_id=0")
+            return 0
 
     def _latest_price(self, symbol: str) -> Optional[float]:
         with self._open_conn() as conn:
@@ -350,6 +374,29 @@ class LiveTrader:
             self._save_state()
         self.trade_timestamps.append(time.time())
         self._enforce_trade_rate_limit()
+
+    def _aggressive_limit_price(self, *, side: str, reference_price: float) -> float:
+        if reference_price <= 0:
+            return reference_price
+
+        slip_fraction = max(self.limit_slippage_bps, 0.0) / 10000.0
+        if side in {"BUY", "COVER"}:
+            adjusted = reference_price * (1 + slip_fraction)
+        else:
+            adjusted = reference_price * (1 - slip_fraction)
+
+        adjusted = max(round(adjusted, 4), 0.01)
+
+        if adjusted != reference_price:
+            LOGGER.info(
+                "Limit price adjusted for slippage guard: %s -> %s (side=%s, %sbps)",
+                reference_price,
+                adjusted,
+                side,
+                self.limit_slippage_bps,
+            )
+
+        return adjusted
 
     # ------------------------------------------------------------------
     # Order + alert processing
@@ -477,7 +524,17 @@ class LiveTrader:
         # if the limit cannot be submitted. Returns True only when the order is
         # accepted and, for limits, actually filled.
         use_limit = self.prefer_limit_orders and not force_market
-        result = self.executor.submit_limit(symbol=symbol, qty=qty, side=side, limit_price=price) if use_limit else None
+        effective_price = (
+            self._aggressive_limit_price(side=side, reference_price=price)
+            if use_limit
+            else price
+        )
+
+        result = (
+            self.executor.submit_limit(symbol=symbol, qty=qty, side=side, limit_price=effective_price)
+            if use_limit
+            else None
+        )
         if use_limit and result and result.get("error"):
             LOGGER.warning(
                 "Limit order for %s %s failed (%s); falling back to market as emergency",
@@ -534,7 +591,7 @@ class LiveTrader:
             direction=direction,
             side=side,
             qty=qty,
-            price=price,
+            price=effective_price,
             result=result,
         )
         return filled
