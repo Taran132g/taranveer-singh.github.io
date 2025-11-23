@@ -657,16 +657,16 @@ def on_book(msg: dict):
                     c = conn.cursor()
                     c.execute("SELECT IFNULL(MAX(rowid), 0) FROM alerts")
                     next_alert_id = (c.fetchone() or [0])[0] + 1
+                inline_ok = True
                 if inline_trader_dispatch:
-                    inline_trader_dispatch(next_alert_id, alert)
-                if not inline_only_mode:
+                    inline_ok = inline_trader_dispatch(next_alert_id, alert)
+                if not inline_only_mode or not inline_ok:
                     c.execute(
                         "INSERT INTO alerts (rowid, timestamp, symbol, ratio, total_bids, total_asks, heavy_venues, direction, price) "
                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (next_alert_id, alert["timestamp"], alert["symbol"], alert["ratio"], alert["total_bids"],
                          alert["total_asks"], alert["heavy_venues"], alert["direction"], alert["price"])
                     )
-                    alert_id = next_alert_id
                     conn.commit()
                 last_alert[sym] = now
                 log_structured("ALERT", {
@@ -848,11 +848,16 @@ async def main():
         inline_trader = LiveTrader(dry_run=_bool_env("INLINE_LIVE_DRY_RUN", False))
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue(maxsize=_get_int_env("INLINE_TRADER_QUEUE", 100, 10))
+        worker_count = _get_int_env("INLINE_TRADER_WORKERS", 1, 1)
+        inline_queue_drops = 0
 
         async def _inline_worker() -> None:
             while True:
-                alert_id, alert = await queue.get()
+                alert_id, alert, enqueued_at = await queue.get()
                 try:
+                    lag = time() - enqueued_at
+                    if lag > 0.5:
+                        log_structured("INLINE_TRADER_LAG", {"alert_id": alert_id, "lag_sec": round(lag, 3)})
                     await loop.run_in_executor(
                         None,
                         inline_trader.process_alert,
@@ -866,16 +871,30 @@ async def main():
                 finally:
                     queue.task_done()
 
-        asyncio.create_task(_inline_worker())
+        for _ in range(worker_count):
+            asyncio.create_task(_inline_worker())
 
-        def inline_trader_dispatch(alert_id: int, alert: dict) -> None:
+        def inline_trader_dispatch(alert_id: int, alert: dict) -> bool:
+            nonlocal inline_queue_drops
             try:
-                queue.put_nowait((alert_id, alert))
+                queue.put_nowait((alert_id, alert, time()))
+                return True
             except asyncio.QueueFull:
-                log_structured(
-                    "INLINE_TRADER_WARNING",
-                    {"status": "queue_full", "alert_id": alert_id, "symbol": alert.get("symbol")},
-                )
+                try:
+                    loop.create_task(queue.put((alert_id, alert, time())))
+                    return True
+                except Exception:
+                    inline_queue_drops += 1
+                    log_structured(
+                        "INLINE_TRADER_WARNING",
+                        {
+                            "status": "queue_full",
+                            "alert_id": alert_id,
+                            "symbol": alert.get("symbol"),
+                            "drops": inline_queue_drops,
+                        },
+                    )
+                    return False
 
         inline_only_mode = inline_only_requested
         inline_log = {"status": "enabled", "dry_run": inline_trader.dry_run}

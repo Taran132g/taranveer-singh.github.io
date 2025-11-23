@@ -7,11 +7,12 @@ from live_trader import LiveTrader
 
 
 class StubOrderExecutor:
-    def __init__(self, *, status_sequence=None, quote=None, fail_cancel=False):
+    def __init__(self, *, status_sequence=None, status_per_order=None, quote=None, fail_cancel=False):
         self.dry_run = True
         self.submitted = []
         self.status_sequence = status_sequence or []
-        self.sticky_status = None
+        self.status_per_order = {k: list(v) for k, v in (status_per_order or {}).items()}
+        self.last_status_by_order = {}
         self.quote = quote or {"bidPrice": 0, "askPrice": 0, "lastPrice": 0}
         self.cancelled = []
         self.fail_cancel = fail_cancel
@@ -25,11 +26,8 @@ class StubOrderExecutor:
             "kind": "limit",
         }
         self.submitted.append(order)
-        return {
-            "order_id": f"LIM-{len(self.submitted)}",
-            "status_code": "201",
-            "dry_run": False,
-        }
+        order_id = f"LIM-{len(self.submitted)}"
+        return {"order_id": order_id, "status_code": "201", "dry_run": False}
 
     def submit_market(self, *, symbol: str, qty: int, side: str):
         order = {
@@ -46,12 +44,18 @@ class StubOrderExecutor:
         }
 
     def fetch_order_status(self, order_id: str):
+        if order_id in self.status_per_order:
+            per_order = self.status_per_order[order_id]
+            if per_order:
+                status = per_order.pop(0)
+                self.last_status_by_order[order_id] = status
+                return status
         if self.status_sequence:
             status = self.status_sequence.pop(0)
-            self.sticky_status = status
+            self.last_status_by_order[order_id] = status
             return status
-        if self.sticky_status:
-            return self.sticky_status
+        if order_id in self.last_status_by_order:
+            return self.last_status_by_order[order_id]
         return {"status": "FILLED", "filled_quantity": None, "raw": {"order_id": order_id}}
 
     def cancel_order(self, order_id: str):
@@ -141,6 +145,29 @@ class LiveTraderInlineFlowTest(unittest.TestCase):
         self.assertIn("LIM-1", executor.cancelled)
         self.assertEqual(trader.positions.get("FAST"), -1000)
 
+    def test_reprice_limit_gets_polled_and_clears_outstanding(self):
+        os.environ["LIVE_LIMIT_FILL_TIMEOUT"] = "0.05"
+        os.environ["LIVE_LIMIT_FILL_POLL_INTERVAL"] = "0.01"
+        os.environ["LIVE_LIMIT_TIMEOUT_POLICY"] = "REPRICE"
+        status_per_order = {
+            "LIM-1": [
+                {"status": "WORKING", "filled_quantity": 0, "raw": {}},
+                {"status": "WORKING", "filled_quantity": 0, "raw": {}},
+            ],
+            "LIM-2": [
+                {"status": "FILLED", "filled_quantity": 1000, "raw": {"order_id": "LIM-2"}},
+            ],
+        }
+        executor = StubOrderExecutor(status_per_order=status_per_order)
+        trader = LiveTrader(dry_run=True, executor=executor)
+
+        trader.process_alert(7, "FAST", "ask-heavy", 15.0)
+
+        self.assertIn("LIM-1", executor.cancelled)
+        self.assertNotIn("FAST", trader.outstanding_limits)
+        self.assertEqual([o["kind"] for o in executor.submitted], ["limit", "limit"])
+        self.assertEqual(trader.positions.get("FAST"), -1000)
+
     def test_reference_price_refreshes_from_quote(self):
         quote = {"bidPrice": 11.9, "askPrice": 12.1, "lastPrice": 12.0}
         executor = StubOrderExecutor(quote=quote)
@@ -153,7 +180,7 @@ class LiveTraderInlineFlowTest(unittest.TestCase):
             cur.execute("SELECT price FROM live_orders ORDER BY id ASC LIMIT 1")
             recorded_price = cur.fetchone()[0]
 
-        self.assertAlmostEqual(recorded_price, 11.988, places=3)
+        self.assertAlmostEqual(recorded_price, 11.8881, places=4)
 
     def test_limit_padding_direction(self):
         base_price = 50.0
