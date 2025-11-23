@@ -545,6 +545,7 @@ def on_timesale(msg: dict):
                 _summarize(sym, now)
 
 def on_book(msg: dict):
+    global _last_msg_ts
     now = time()
     for it in msg.get("content", []):
         sym = it.get("key")
@@ -846,18 +847,35 @@ async def main():
 
         inline_trader = LiveTrader(dry_run=_bool_env("INLINE_LIVE_DRY_RUN", False))
         loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue(maxsize=_get_int_env("INLINE_TRADER_QUEUE", 100, 10))
+
+        async def _inline_worker() -> None:
+            while True:
+                alert_id, alert = await queue.get()
+                try:
+                    await loop.run_in_executor(
+                        None,
+                        inline_trader.process_alert,
+                        int(alert_id),
+                        alert["symbol"],
+                        alert["direction"],
+                        float(alert["price"]),
+                    )
+                except Exception as exc:
+                    log_structured("INLINE_TRADER_ERROR", {"error": str(exc), "alert_id": alert_id})
+                finally:
+                    queue.task_done()
+
+        asyncio.create_task(_inline_worker())
 
         def inline_trader_dispatch(alert_id: int, alert: dict) -> None:
-            asyncio.create_task(
-                loop.run_in_executor(
-                    None,
-                    inline_trader.process_alert,
-                    int(alert_id),
-                    alert["symbol"],
-                    alert["direction"],
-                    float(alert["price"]),
+            try:
+                queue.put_nowait((alert_id, alert))
+            except asyncio.QueueFull:
+                log_structured(
+                    "INLINE_TRADER_WARNING",
+                    {"status": "queue_full", "alert_id": alert_id, "symbol": alert.get("symbol")},
                 )
-            )
 
         inline_only_mode = inline_only_requested
         inline_log = {"status": "enabled", "dry_run": inline_trader.dry_run}

@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
@@ -133,6 +133,48 @@ class SchwabOrderExecutor:
             LOGGER.info("Order accepted (id=%s) for %s %s %s", result["order_id"], side, qty, symbol)
 
         return result
+
+    def cancel_order(self, order_id: str) -> bool:
+        if self.dry_run:
+            LOGGER.info("[DRY-RUN] Skip cancel order %s", order_id)
+            return True
+
+        cancel_one = getattr(self.client, "cancel_order", None)
+        if cancel_one is None:
+            LOGGER.warning("Schwab client does not expose cancel_order; attempting cancel_all")
+            return self.cancel_all_orders()
+
+        try:
+            cancel_one(self.account_id, order_id)
+            LOGGER.info("Cancel request sent for order %s", order_id)
+            return True
+        except Exception as exc:  # pragma: no cover - network interaction
+            LOGGER.error("Failed to cancel order %s: %s", order_id, exc)
+            return False
+
+    def fetch_quote(self, symbol: str) -> Optional[dict]:
+        if self.dry_run:
+            return None
+
+        fetch_quote = getattr(self.client, "get_quote", None)
+        if fetch_quote is None:
+            LOGGER.warning("Schwab client does not expose get_quote; skipping refresh")
+            return None
+
+        try:
+            response = fetch_quote([symbol])
+        except Exception as exc:  # pragma: no cover - network interaction
+            LOGGER.warning("Quote fetch failed for %s: %s", symbol, exc)
+            return None
+
+        try:
+            payload = response.json() if hasattr(response, "json") else None
+        except Exception:
+            payload = None
+
+        if isinstance(payload, dict):
+            return payload.get(symbol) or payload
+        return None
 
     def fetch_order_status(self, order_id: str) -> Dict[str, Optional[str]]:
         result: Dict[str, Optional[str]] = {"order_id": order_id, "status": None, "error": None}
@@ -251,9 +293,14 @@ class LiveTrader:
         self.max_trades_per_hour = int(os.getenv("LIVE_MAX_TRADES_PER_HOUR", "60"))
         self.limit_fill_timeout = float(os.getenv("LIVE_LIMIT_FILL_TIMEOUT", "60"))
         self.limit_fill_poll_interval = float(os.getenv("LIVE_LIMIT_FILL_POLL_INTERVAL", "2"))
+        self.limit_timeout_policy = os.getenv("LIVE_LIMIT_TIMEOUT_POLICY", "MARKET").upper()
+        if self.limit_timeout_policy not in {"ABANDON", "REPRICE", "MARKET"}:
+            LOGGER.warning("Invalid LIVE_LIMIT_TIMEOUT_POLICY '%s'; defaulting to MARKET", self.limit_timeout_policy)
+            self.limit_timeout_policy = "MARKET"
         self.positions: Dict[str, int] = {}
         self.last_alert_id = 0
         self.trade_timestamps: list[float] = []
+        self.outstanding_limits: Dict[str, str] = {}
         self._lock = threading.Lock()
 
         self._load_state()
@@ -375,6 +422,36 @@ class LiveTrader:
         self.trade_timestamps.append(time.time())
         self._enforce_trade_rate_limit()
 
+    def _reference_price(self, *, symbol: str, alert_price: float) -> float:
+        quote = None
+        try:
+            quote = self.executor.fetch_quote(symbol)
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.warning("Quote refresh failed for %s: %s", symbol, exc)
+
+        if isinstance(quote, dict):
+            bid = quote.get("bidPrice") or quote.get("bid") or quote.get("bid_price")
+            ask = quote.get("askPrice") or quote.get("ask") or quote.get("ask_price")
+            last = quote.get("lastPrice") or quote.get("last") or quote.get("last_price")
+            try:
+                values = [float(v) for v in [bid, ask, last] if v not in {None, ""}]
+            except (TypeError, ValueError):
+                values = []
+            if values:
+                refreshed = sum(values) / len(values)
+                LOGGER.info(
+                    "Using refreshed quote for %s (bid=%s ask=%s last=%s -> ref=%s)",
+                    symbol,
+                    bid,
+                    ask,
+                    last,
+                    refreshed,
+                )
+                return refreshed
+
+        LOGGER.info("Using alert price as reference for %s due to missing quote", symbol)
+        return alert_price
+
     def _aggressive_limit_price(self, *, side: str, reference_price: float) -> float:
         if reference_price <= 0:
             return reference_price
@@ -401,14 +478,26 @@ class LiveTrader:
     # ------------------------------------------------------------------
     # Order + alert processing
     # ------------------------------------------------------------------
-    def _poll_limit_fill(self, *, order_id: str, symbol: str, side: str, qty: int) -> bool:
+    def _poll_limit_fill(self, *, order_id: str, symbol: str, side: str, qty: int) -> Tuple[bool, int, Optional[str]]:
         start = time.time()
         deadline = start + self.limit_fill_timeout
         last_status: Optional[str] = None
+        filled_qty_seen = 0
+
+        filled_statuses = {
+            "FILLED",
+            "FILLED_ALL",
+            "FILLED_ALL_SHARES",
+            "EXECUTED",
+            "COMPLETED",
+        }
+        terminal_reject_statuses = {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}
+        partial_statuses = {"PARTIALLY_FILLED", "PARTIAL_FILL", "WORKING", "ACCEPTED"}
 
         while time.time() < deadline:
             status = self.executor.fetch_order_status(order_id)
             last_status = (status.get("status") or "").upper()
+            LOGGER.debug("Poll status for %s: %s", order_id, status.get("raw") or status)
 
             if status.get("error"):
                 LOGGER.warning(
@@ -421,14 +510,31 @@ class LiveTrader:
                 )
                 break
 
-            if last_status in {"FILLED", "FILLED_ALL", "FILLED_ALL_SHARES"}:
-                LOGGER.info("Limit order %s filled for %s %s %s", order_id, side, qty, symbol)
-                self._record_fill(symbol=symbol, side=side, qty=qty)
-                return True
+            filled_quantity = status.get("filled_quantity")
+            try:
+                filled_quantity = int(float(filled_quantity)) if filled_quantity is not None else None
+            except (TypeError, ValueError):
+                filled_quantity = None
 
-            if last_status in {"CANCELED", "REJECTED", "EXPIRED"}:
+            if filled_quantity is not None and filled_quantity > filled_qty_seen:
+                delta = min(filled_quantity, qty) - filled_qty_seen
+                if delta > 0:
+                    self._record_fill(symbol=symbol, side=side, qty=delta)
+                    filled_qty_seen += delta
+
+            if last_status in filled_statuses:
+                if filled_qty_seen < qty:
+                    self._record_fill(symbol=symbol, side=side, qty=qty - filled_qty_seen)
+                    filled_qty_seen = qty
+                LOGGER.info("Limit order %s filled for %s %s %s", order_id, side, qty, symbol)
+                return True, filled_qty_seen, last_status
+
+            if last_status in terminal_reject_statuses:
                 LOGGER.warning("Limit order %s ended with status %s", order_id, last_status)
-                return False
+                return False, filled_qty_seen, last_status
+
+            if last_status in partial_statuses and filled_qty_seen >= qty:
+                return True, filled_qty_seen, last_status
 
             time.sleep(self.limit_fill_poll_interval)
 
@@ -437,7 +543,7 @@ class LiveTrader:
             order_id,
             last_status,
         )
-        return False
+        return False, filled_qty_seen, last_status or "TIMEOUT"
 
     def _enforce_trade_rate_limit(self) -> None:
         cutoff = time.time() - 3600
@@ -523,11 +629,12 @@ class LiveTrader:
         # (market). When we pick limit, we still backstop with a market order
         # if the limit cannot be submitted. Returns True only when the order is
         # accepted and, for limits, actually filled.
+        reference_price = self._reference_price(symbol=symbol, alert_price=price)
         use_limit = self.prefer_limit_orders and not force_market
         effective_price = (
-            self._aggressive_limit_price(side=side, reference_price=price)
+            self._aggressive_limit_price(side=side, reference_price=reference_price)
             if use_limit
-            else price
+            else reference_price
         )
 
         result = (
@@ -558,11 +665,14 @@ class LiveTrader:
 
         filled = False
         fill_status: Optional[str] = None
+        filled_qty = 0
+        self.outstanding_limits.pop(symbol, None)
 
         if submitted:
             if result.get("dry_run") or not use_limit:
                 self._record_fill(symbol=symbol, side=side, qty=qty)
                 filled = True
+                filled_qty = qty
                 fill_status = "FILLED"
             else:
                 order_id = result.get("order_id")
@@ -575,15 +685,90 @@ class LiveTrader:
                         side,
                         qty,
                         symbol,
-                        price,
+                        effective_price,
                     )
-                    poll_success = self._poll_limit_fill(order_id=order_id, symbol=symbol, side=side, qty=qty)
+                    self.outstanding_limits[symbol] = order_id
+                    poll_success, filled_qty, last_status = self._poll_limit_fill(
+                        order_id=order_id, symbol=symbol, side=side, qty=qty
+                    )
                     filled = poll_success
-                    fill_status = "FILLED" if poll_success else "FAILED"
+                    fill_status = "FILLED" if poll_success else last_status or "FAILED"
+                    if poll_success:
+                        self.outstanding_limits.pop(symbol, None)
+                    if not poll_success:
+                        cancelled = self.executor.cancel_order(order_id)
+                        if cancelled:
+                            self.outstanding_limits.pop(symbol, None)
+                        else:
+                            LOGGER.warning(
+                                "Unable to cancel unfilled order %s for %s; tracking as open",
+                                order_id,
+                                symbol,
+                            )
+                            self.outstanding_limits[symbol] = order_id
+
+                        remaining_qty = max(qty - filled_qty, 0)
+                        result["timeout_policy"] = self.limit_timeout_policy
+                        if remaining_qty > 0 and cancelled:
+                            if self.limit_timeout_policy == "REPRICE":
+                                new_price = self._aggressive_limit_price(
+                                    side=side, reference_price=self._reference_price(symbol=symbol, alert_price=reference_price)
+                                )
+                                LOGGER.info(
+                                    "Repricing %s %s %s after timeout to %s",
+                                    side,
+                                    remaining_qty,
+                                    symbol,
+                                    new_price,
+                                )
+                                result["fallback"] = self.executor.submit_limit(
+                                    symbol=symbol, qty=remaining_qty, side=side, limit_price=new_price
+                                )
+                                if result["fallback"].get("error"):
+                                    LOGGER.warning(
+                                        "Repriced limit failed for %s %s %s: %s",
+                                        side,
+                                        remaining_qty,
+                                        symbol,
+                                        result["fallback"].get("error"),
+                                    )
+                                else:
+                                    fallback_id = result["fallback"].get("order_id")
+                                    if fallback_id:
+                                        self.outstanding_limits[symbol] = fallback_id
+                                    result["fallback_fill_status"] = "SUBMITTED"
+                            elif self.limit_timeout_policy == "MARKET":
+                                LOGGER.info(
+                                    "Timeout policy MARKET: sending market for remaining %s %s",
+                                    remaining_qty,
+                                    symbol,
+                                )
+                                fallback = self.executor.submit_market(symbol=symbol, qty=remaining_qty, side=side)
+                                result["fallback"] = fallback
+                                fallback_ok = fallback.get("error") is None and (
+                                    fallback.get("dry_run")
+                                    or (fallback.get("status_code") and str(fallback.get("status_code")).startswith("2"))
+                                )
+                                if fallback_ok:
+                                    self._record_fill(symbol=symbol, side=side, qty=remaining_qty)
+                                    filled = True
+                                    fill_status = "FILLED"
+                                    filled_qty = qty
+                                else:
+                                    result["fallback_fill_status"] = "FAILED"
+                            else:
+                                LOGGER.info("Timeout policy ABANDON: leaving remaining qty unfilled")
+                        elif remaining_qty == 0:
+                            filled = True
+                            fill_status = "FILLED"
         else:
             fill_status = "FAILED"
 
+        if filled and filled_qty == 0:
+            filled_qty = qty
+
         result["fill_status"] = fill_status
+        result["filled_qty"] = filled_qty
 
         self._record_order(
             alert_id=alert_id,
@@ -597,6 +782,15 @@ class LiveTrader:
         return filled
 
     def _handle_alert(self, alert_id: int, symbol: str, direction: str, price: float) -> None:
+        if symbol in self.outstanding_limits:
+            LOGGER.warning(
+                "Outstanding limit order %s for %s; skipping alert %s to avoid double exposure",
+                self.outstanding_limits[symbol],
+                symbol,
+                alert_id,
+            )
+            return
+
         position = self.positions.get(symbol, 0)
 
         if direction == "ask-heavy":

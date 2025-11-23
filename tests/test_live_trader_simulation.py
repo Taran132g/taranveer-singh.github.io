@@ -7,9 +7,14 @@ from live_trader import LiveTrader
 
 
 class StubOrderExecutor:
-    def __init__(self):
+    def __init__(self, *, status_sequence=None, quote=None, fail_cancel=False):
         self.dry_run = True
         self.submitted = []
+        self.status_sequence = status_sequence or []
+        self.sticky_status = None
+        self.quote = quote or {"bidPrice": 0, "askPrice": 0, "lastPrice": 0}
+        self.cancelled = []
+        self.fail_cancel = fail_cancel
 
     def submit_limit(self, *, symbol: str, qty: int, side: str, limit_price: float):
         order = {
@@ -23,7 +28,7 @@ class StubOrderExecutor:
         return {
             "order_id": f"LIM-{len(self.submitted)}",
             "status_code": "201",
-            "dry_run": True,
+            "dry_run": False,
         }
 
     def submit_market(self, *, symbol: str, qty: int, side: str):
@@ -37,22 +42,45 @@ class StubOrderExecutor:
         return {
             "order_id": f"MKT-{len(self.submitted)}",
             "status_code": "201",
-            "dry_run": True,
+            "dry_run": False,
         }
+
+    def fetch_order_status(self, order_id: str):
+        if self.status_sequence:
+            status = self.status_sequence.pop(0)
+            self.sticky_status = status
+            return status
+        if self.sticky_status:
+            return self.sticky_status
+        return {"status": "FILLED", "filled_quantity": None, "raw": {"order_id": order_id}}
+
+    def cancel_order(self, order_id: str):
+        if self.fail_cancel:
+            return False
+        self.cancelled.append(order_id)
+        return True
 
     def cancel_all_orders(self):
         return True
+
+    def fetch_quote(self, symbol: str):
+        return {"symbol": symbol, **self.quote}
 
 
 class LiveTraderInlineFlowTest(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
         self.db_path = os.path.join(self.tmpdir.name, "test_alerts.db")
+        self.state_path = os.path.join(self.tmpdir.name, "state.json")
         os.environ["DB_PATH"] = self.db_path
         os.environ["LIVE_POSITION_SIZE"] = "1000"
         os.environ["LIVE_SHORT_SIZE"] = "1000"
         os.environ["LIVE_LIMIT_SLIPPAGE_BPS"] = "10"
         os.environ["LIVE_PREFER_LIMIT_ORDERS"] = "1"
+        os.environ["LIVE_LIMIT_FILL_TIMEOUT"] = "0.2"
+        os.environ["LIVE_LIMIT_FILL_POLL_INTERVAL"] = "0.05"
+        os.environ["LIVE_LIMIT_TIMEOUT_POLICY"] = "MARKET"
+        os.environ["LIVE_STATE_FILE"] = self.state_path
         self.executor = StubOrderExecutor()
         self.trader = LiveTrader(dry_run=True, executor=self.executor)
 
@@ -64,6 +92,10 @@ class LiveTraderInlineFlowTest(unittest.TestCase):
             "LIVE_SHORT_SIZE",
             "LIVE_LIMIT_SLIPPAGE_BPS",
             "LIVE_PREFER_LIMIT_ORDERS",
+            "LIVE_LIMIT_FILL_TIMEOUT",
+            "LIVE_LIMIT_FILL_POLL_INTERVAL",
+            "LIVE_LIMIT_TIMEOUT_POLICY",
+            "LIVE_STATE_FILE",
         ]:
             os.environ.pop(key, None)
 
@@ -95,6 +127,33 @@ class LiveTraderInlineFlowTest(unittest.TestCase):
 
         self.assertEqual(total_orders, 3)
         self.assertAlmostEqual(last_price, 10.2102, places=4)
+
+    def test_limit_timeout_triggers_market_fallback(self):
+        os.environ["LIVE_LIMIT_FILL_TIMEOUT"] = "0.05"
+        os.environ["LIVE_LIMIT_FILL_POLL_INTERVAL"] = "0.01"
+        os.environ["LIVE_LIMIT_TIMEOUT_POLICY"] = "MARKET"
+        executor = StubOrderExecutor(status_sequence=[{"status": "WORKING", "filled_quantity": 0, "raw": {}}])
+        trader = LiveTrader(dry_run=True, executor=executor)
+
+        trader.process_alert(5, "FAST", "ask-heavy", 20.0)
+
+        self.assertEqual([o["kind"] for o in executor.submitted], ["limit", "market"])
+        self.assertIn("LIM-1", executor.cancelled)
+        self.assertEqual(trader.positions.get("FAST"), -1000)
+
+    def test_reference_price_refreshes_from_quote(self):
+        quote = {"bidPrice": 11.9, "askPrice": 12.1, "lastPrice": 12.0}
+        executor = StubOrderExecutor(quote=quote)
+        trader = LiveTrader(dry_run=True, executor=executor)
+
+        trader.process_alert(6, "REF", "ask-heavy", 10.0)
+
+        with sqlite3.connect(os.environ["DB_PATH"]) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT price FROM live_orders ORDER BY id ASC LIMIT 1")
+            recorded_price = cur.fetchone()[0]
+
+        self.assertAlmostEqual(recorded_price, 11.988, places=3)
 
     def test_limit_padding_direction(self):
         base_price = 50.0
