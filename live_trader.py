@@ -474,7 +474,7 @@ class LiveTrader:
 
             if ref is None:
                 try:
-                    ref = float(bid + ask) / 2 if bid not in {None, ""} and ask not in {None, ""} else None
+                    ref = (float(bid) + float(ask)) / 2 if bid not in {None, ""} and ask not in {None, ""} else None
                 except Exception:
                     ref = None
 
@@ -672,6 +672,7 @@ class LiveTrader:
         qty = int(entry.get("qty") or 0)
         side = str(entry.get("side") or "").upper()
         filled_seen = int(entry.get("filled_seen") or 0)
+        cancel_attempts = int(entry.get("cancel_attempts") or 0)
 
         status = self.executor.fetch_order_status(order_id)
         status_name = (status.get("status") or "").upper()
@@ -699,6 +700,15 @@ class LiveTrader:
             return False
 
         age = time.time() - float(entry.get("since", time.time()))
+        if status.get("error") and age > self.limit_fill_timeout:
+            LOGGER.warning(
+                "Outstanding limit %s for %s has status error '%s'; attempting cancel after %.1fs",
+                order_id,
+                symbol,
+                status.get("error"),
+                age,
+            )
+            status_name = "UNKNOWN"
         if age > self.limit_fill_timeout:
             LOGGER.warning(
                 "Outstanding limit %s for %s still %s after %.1fs; attempting cancel", order_id, symbol, status_name, age
@@ -722,6 +732,14 @@ class LiveTrader:
                 self.outstanding_limits.pop(symbol, None)
                 return False
             entry["since"] = time.time()
+            entry["cancel_attempts"] = cancel_attempts + 1
+            if entry["cancel_attempts"] >= 3:
+                LOGGER.warning(
+                    "Exceeded cancel attempts for %s; clearing outstanding guard to avoid permanent block",
+                    symbol,
+                )
+                self.outstanding_limits.pop(symbol, None)
+                return False
 
         return True
 
@@ -805,6 +823,7 @@ class LiveTrader:
                         "side": side,
                         "qty": qty,
                         "filled_seen": 0,
+                        "cancel_attempts": 0,
                     }
                     poll_success, filled_qty, last_status = self._poll_limit_fill(
                         order_id=order_id, symbol=symbol, side=side, qty=qty
@@ -843,6 +862,7 @@ class LiveTrader:
                                 "side": side,
                                 "qty": qty,
                                 "filled_seen": filled_qty,
+                                "cancel_attempts": 1,
                             }
 
                         remaining_qty = max(qty - filled_qty, 0)
@@ -883,24 +903,33 @@ class LiveTrader:
                                             "side": side,
                                             "qty": remaining_qty,
                                             "filled_seen": filled_qty,
+                                            "cancel_attempts": 0,
                                         }
-                                    result["fallback_fill_status"] = "SUBMITTED"
-                                    repoll_success, repoll_filled, repoll_status = self._poll_limit_fill(
-                                        order_id=fallback_id,
-                                        symbol=symbol,
-                                        side=side,
-                                        qty=remaining_qty,
-                                        already_filled=0,
-                                    )
-                                    filled_qty += repoll_filled
-                                    filled = repoll_success
-                                    if repoll_success:
-                                        result["filled_via"] = "REPRICE_LIMIT"
-                                        self.outstanding_limits.pop(symbol, None)
-                                        fill_status = "FILLED"
+                                        result["fallback_fill_status"] = "SUBMITTED"
+                                        repoll_success, repoll_filled, repoll_status = self._poll_limit_fill(
+                                            order_id=fallback_id,
+                                            symbol=symbol,
+                                            side=side,
+                                            qty=remaining_qty,
+                                            already_filled=0,
+                                        )
+                                        filled_qty += repoll_filled
+                                        filled = repoll_success
+                                        if repoll_success:
+                                            result["filled_via"] = "REPRICE_LIMIT"
+                                            self.outstanding_limits.pop(symbol, None)
+                                            fill_status = "FILLED"
+                                        else:
+                                            result["fallback_fill_status"] = repoll_status or "FAILED"
+                                            fill_status = repoll_status or fill_status
                                     else:
-                                        result["fallback_fill_status"] = repoll_status or "FAILED"
-                                        fill_status = repoll_status or fill_status
+                                        LOGGER.warning(
+                                            "Repriced limit for %s %s %s returned no order_id; skipping repoll",
+                                            side,
+                                            remaining_qty,
+                                            symbol,
+                                        )
+                                        result["fallback_fill_status"] = "FAILED"
                             elif self.limit_timeout_policy == "MARKET":
                                 LOGGER.info(
                                     "Timeout policy MARKET: sending market for remaining %s %s",

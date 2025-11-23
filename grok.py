@@ -685,7 +685,15 @@ async def resolve_exchange(client: Client, sym: str) -> Optional[str]:
     if sym in exchange_cache:
         return exchange_cache[sym]
     try:
-        instruments = await client.get_instruments([sym], projection="fundamental")
+        get_instruments = getattr(client, "get_instruments", None)
+        if get_instruments is None:
+            raise RuntimeError("Client missing get_instruments")
+
+        instruments = get_instruments([sym], projection="fundamental")
+        if asyncio.iscoroutine(instruments):
+            instruments = await instruments
+        if hasattr(instruments, "json"):
+            instruments = instruments.json()
         for inst in instruments:
             if inst.get("symbol") == sym:
                 exchange = inst.get("primary_exchange")
@@ -795,10 +803,10 @@ async def main():
     DB_PATH = args.db_path if args.db_path is not None else os.getenv("DB_PATH", "penny_basing.db")
     os.environ["DB_PATH"] = str(DB_PATH)
     inline_only_requested = _bool_env("INLINE_DISPATCH_ONLY", False)
-    # if args.symbols:
-    #     SYMBOLS = [s.strip().upper() for s in args.symbols.replace(" ", ",").split(",") if s.strip()]
-    # else:
-    SYMBOLS = _parse_symbols_from_env("SYMBOLS", "F")
+    if args.symbols:
+        SYMBOLS = [s.strip().upper() for s in args.symbols.replace(" ", ",").split(",") if s.strip()]
+    else:
+        SYMBOLS = _parse_symbols_from_env("SYMBOLS", "F")
     DISABLE_BID_HEAVY = bool(args.disable_bid_heavy)
     DEBUG_BOOK_RAW = bool(args.debug_book_raw)
     JSON_BOOK = bool(args.json_book)
@@ -880,21 +888,17 @@ async def main():
                 queue.put_nowait((alert_id, alert, time()))
                 return True
             except asyncio.QueueFull:
-                try:
-                    loop.create_task(queue.put((alert_id, alert, time())))
-                    return True
-                except Exception:
-                    inline_queue_drops += 1
-                    log_structured(
-                        "INLINE_TRADER_WARNING",
-                        {
-                            "status": "queue_full",
-                            "alert_id": alert_id,
-                            "symbol": alert.get("symbol"),
-                            "drops": inline_queue_drops,
-                        },
-                    )
-                    return False
+                inline_queue_drops += 1
+                log_structured(
+                    "INLINE_TRADER_WARNING",
+                    {
+                        "status": "queue_full",
+                        "alert_id": alert_id,
+                        "symbol": alert.get("symbol"),
+                        "drops": inline_queue_drops,
+                    },
+                )
+                return False
 
         inline_only_mode = inline_only_requested
         inline_log = {"status": "enabled", "dry_run": inline_trader.dry_run}
