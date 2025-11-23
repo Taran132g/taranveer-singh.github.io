@@ -58,3 +58,13 @@ stale data can miss. Two safeguards reduce that risk:
 - Verify DB `live_orders` rows record the adjusted price you expect.
 - In dry-run mode, confirm `_record_fill` messages fire only after the fill poll
   succeeds; otherwise the position should remain unchanged.
+
+## What changed in this PR
+- Inline alert durability is stronger: if the low-latency queue is full we still
+  fall back to the DB so no alerts are lost.
+- Pricing uses side-aware quotes with safer casting to avoid midpoint bugs that
+  could block orders.
+- Repriced limits now guard against missing order IDs and track cancel attempts
+  so symbols do not get stuck behind an old working order.
+- CLI symbol overrides work again, and instrument lookup handles both sync and
+  async Schwab clients for wider compatibility.
