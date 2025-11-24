@@ -276,54 +276,38 @@ class LiveTrader:
             if position < 0:
                 return
             if position > 0:
-                flattened = self._submit_order(
-                    alert_id=alert_id,
-                    symbol=symbol,
-                    direction=direction,
-                    side="SELL",
-                    qty=position,
-                    price=price,
+                qty = position + self.short_size
+                LOGGER.info(
+                    "Flipping long -> short in one order: shorting %s shares (current=%s, target=%s)",
+                    qty,
+                    position,
+                    self.short_size,
                 )
-                if not flattened:
-                    LOGGER.warning(
-                        "Skipping SHORT on %s because closing SELL failed (alert %s)",
-                        symbol,
-                        alert_id,
-                    )
-                    return
             self._submit_order(
                 alert_id=alert_id,
                 symbol=symbol,
                 direction=direction,
                 side="SHORT",
-                qty=self.short_size,
+                qty=position + self.short_size if position > 0 else self.short_size,
                 price=price,
             )
         elif direction == "bid-heavy":
             if position > 0:
                 return
             if position < 0:
-                flattened = self._submit_order(
-                    alert_id=alert_id,
-                    symbol=symbol,
-                    direction=direction,
-                    side="COVER",
-                    qty=abs(position),
-                    price=price,
+                qty = abs(position) + self.position_size
+                LOGGER.info(
+                    "Flipping short -> long in one order: buying %s shares (current=%s, target=%s)",
+                    qty,
+                    position,
+                    self.position_size,
                 )
-                if not flattened:
-                    LOGGER.warning(
-                        "Skipping BUY on %s because closing COVER failed (alert %s)",
-                        symbol,
-                        alert_id,
-                    )
-                    return
             self._submit_order(
                 alert_id=alert_id,
                 symbol=symbol,
                 direction=direction,
                 side="BUY",
-                qty=self.position_size,
+                qty=abs(position) + self.position_size if position < 0 else self.position_size,
                 price=price,
             )
 
