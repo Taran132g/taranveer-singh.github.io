@@ -32,6 +32,7 @@ universe.
 | `run_both.sh` / `stop_trading_bot.sh` | Convenience shell scripts for launching/killing the alert bot + dashboard together. |
 | `sql.py` | Example read-only queries for exploring the SQLite database. |
 | `requirements.txt` | Python dependencies for the whole stack. |
+| `simulator.py` / `example_simulator.py` | Order execution simulator and runnable examples for latency/slippage/fill modeling. |
 
 ## Prerequisites
 
@@ -149,6 +150,16 @@ python live_trader.py --db penny_basing.db --min-alert-id 0
   after restarting the bot.
 - Ensure `SCHWAB_ACCOUNT_ID` points to your paperMoney account hash before going
   live.
+
+## Simulator and offline execution experiments
+
+The simulator in `simulator.py` mimics the Schwab execution surface with
+configurable latency, slippage, and probabilistic limit-order fills. Pair it
+with `example_simulator.py` for quick scenarios (market/limit walkthroughs,
+metrics collection, SQLite persistence, alert replay) or check
+`simulator_usage.md` for a deeper guide to configuration, metrics, and schema
+details. Visualization helpers in `visualize_simulator.py` can plot latency,
+slippage, and cumulative limit fill rates from simulator runs.
 
 ## Support/resistance scanning
 

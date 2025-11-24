@@ -3,3 +3,4 @@ python-dotenv
 schwab-py
 streamlit
 yfinance
+matplotlib
