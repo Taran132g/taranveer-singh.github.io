@@ -36,10 +36,11 @@ cleanup() {
 
 trap 'cleanup' INT TERM EXIT
 
-echo "[1/5] Running initial support/resistance scan..."
-$PYTHON_BIN sup_res.py --once --output "$ALERTS_FILE" | tee "$SUP_LOG"
+echo "[1/5] Skipping support/resistance scan (manual symbol list for testing)..."
+# $PYTHON_BIN sup_res.py --once --output "$ALERTS_FILE" | tee "$SUP_LOG"
 
-SYMBOLS_LINE=$(awk -F ':' '/^TICKERS:/ {gsub(/ /,"",$2); print $2}' "$ALERTS_FILE")
+# SYMBOLS_LINE=$(awk -F ':' '/^TICKERS:/ {gsub(/ /,"",$2); print $2}' "$ALERTS_FILE")
+SYMBOLS_LINE="F"
 
 echo "[2/5] Starting grok.py..."
 $PYTHON_BIN grok.py --symbols "$SYMBOLS_LINE" --min-volume 100000 \
@@ -81,16 +82,16 @@ $PYTHON_BIN -m streamlit run ui.py \
 UI_PID=$!
 echo " • UI running → http://localhost:8501"
 
-echo -e "\n[WATCH] Starting sup_res watch..."
-$PYTHON_BIN sup_res.py --watch --output "$ALERTS_FILE" >> "$SUP_LOG" 2>&1 &
-SUP_PID=$!
+echo -e "\n[WATCH] Support/resistance watch disabled for manual testing"
+# $PYTHON_BIN sup_res.py --watch --output "$ALERTS_FILE" >> "$SUP_LOG" 2>&1 &
+# SUP_PID=$!
 
 echo -e "\nALL SERVICES RUNNING:"
-echo " • sup_res (watch)   → $SUP_LOG"
+# echo " • sup_res (watch)   → $SUP_LOG"
 echo " • grok              → $GROK_LOG"
 echo " • paper_trader      → $PAPER_LOG"
 echo " • live_trader       → $LIVE_LOG"
 echo " • UI                → $UI_LOG"
 echo -e "\nCTRL+C to shut everything down.\n"
 
-wait "$SUP_PID"
+wait "${SUP_PID:-}"
