@@ -546,7 +546,9 @@ class LiveTrader:
 
         if direction == "ask-heavy":
             if position < 0:
+                LOGGER.info("Already short %s; skip stacking", symbol)
                 return
+
             if position > 0:
                 flattened = self._submit_order(
                     alert_id=alert_id,
@@ -563,6 +565,7 @@ class LiveTrader:
                         alert_id,
                     )
                     return
+
             self._submit_order(
                 alert_id=alert_id,
                 symbol=symbol,
@@ -573,7 +576,9 @@ class LiveTrader:
             )
         elif direction == "bid-heavy":
             if position > 0:
+                LOGGER.info("Already long %s; skip stacking", symbol)
                 return
+
             if position < 0:
                 flattened = self._submit_order(
                     alert_id=alert_id,
@@ -590,6 +595,7 @@ class LiveTrader:
                         alert_id,
                     )
                     return
+
             self._submit_order(
                 alert_id=alert_id,
                 symbol=symbol,
