@@ -275,39 +275,41 @@ class LiveTrader:
         if direction == "ask-heavy":
             if position < 0:
                 return
+            qty = self.short_size
             if position > 0:
-                qty = position + self.short_size
                 LOGGER.info(
                     "Flipping long -> short in one order: shorting %s shares (current=%s, target=%s)",
-                    qty,
+                    position + self.short_size,
                     position,
                     self.short_size,
                 )
+                qty += position
             self._submit_order(
                 alert_id=alert_id,
                 symbol=symbol,
                 direction=direction,
                 side="SHORT",
-                qty=position + self.short_size if position > 0 else self.short_size,
+                qty=qty,
                 price=price,
             )
         elif direction == "bid-heavy":
             if position > 0:
                 return
+            qty = self.position_size
             if position < 0:
-                qty = abs(position) + self.position_size
                 LOGGER.info(
                     "Flipping short -> long in one order: buying %s shares (current=%s, target=%s)",
-                    qty,
+                    abs(position) + self.position_size,
                     position,
                     self.position_size,
                 )
+                qty += abs(position)
             self._submit_order(
                 alert_id=alert_id,
                 symbol=symbol,
                 direction=direction,
                 side="BUY",
-                qty=abs(position) + self.position_size if position < 0 else self.position_size,
+                qty=qty,
                 price=price,
             )
 
