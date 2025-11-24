@@ -245,29 +245,60 @@ class LiveTrader:
             )
             conn.commit()
 
-    def _submit_order(self, *, alert_id: int, symbol: str, direction: str, side: str, qty: int, price: float) -> bool:
+    def _submit_order(
+        self,
+        *,
+        alert_id: int,
+        symbol: str,
+        direction: str,
+        side: str,
+        qty: int,
+        price: float,
+        force_market: bool = False,
+    ) -> bool:
+        # Always use market orders for alerts; limit logic is disabled to
+        # reduce order counts and simplify fills.
+        reference_price = self._reference_price(symbol=symbol, alert_price=price, side=side)
         result = self.executor.submit_market(symbol=symbol, qty=qty, side=side)
-        success = result.get("error") is None and (
+
+        submitted = result.get("error") is None and (
             result.get("dry_run")
             or (
                 result.get("status_code") not in {None, ""}
                 and str(result.get("status_code")).startswith("2")
             )
         )
-        if success and not result.get("dry_run"):
-            delta = qty if side in {"BUY", "COVER"} else -qty
-            self._apply_position_delta(symbol, delta)
-            self._save_state()
+
+        filled = False
+        fill_status: Optional[str] = None
+        filled_qty = 0
+        self.outstanding_limits.pop(symbol, None)
+
+        if submitted:
+            self._record_fill(symbol=symbol, side=side, qty=qty)
+            filled = True
+            filled_qty = qty
+            fill_status = "FILLED"
+            result["filled_via"] = "MARKET"
+        else:
+            fill_status = "FAILED"
+
+        if filled and filled_qty == 0:
+            filled_qty = qty
+
+        result["fill_status"] = fill_status
+        result["filled_qty"] = filled_qty
+
         self._record_order(
             alert_id=alert_id,
             symbol=symbol,
             direction=direction,
             side=side,
             qty=qty,
-            price=price,
+            price=reference_price,
             result=result,
         )
-        return success
+        return filled
 
     def _handle_alert(self, alert_id: int, symbol: str, direction: str, price: float) -> None:
         position = self.positions.get(symbol, 0)
@@ -275,55 +306,41 @@ class LiveTrader:
         if direction == "ask-heavy":
             if position < 0:
                 return
+            qty = self.short_size
             if position > 0:
-                flattened = self._submit_order(
-                    alert_id=alert_id,
-                    symbol=symbol,
-                    direction=direction,
-                    side="SELL",
-                    qty=position,
-                    price=price,
+                LOGGER.info(
+                    "Flipping long -> short in one order: shorting %s shares (current=%s, target=%s)",
+                    position + self.short_size,
+                    position,
+                    self.short_size,
                 )
-                if not flattened:
-                    LOGGER.warning(
-                        "Skipping SHORT on %s because closing SELL failed (alert %s)",
-                        symbol,
-                        alert_id,
-                    )
-                    return
+                qty += position
             self._submit_order(
                 alert_id=alert_id,
                 symbol=symbol,
                 direction=direction,
                 side="SHORT",
-                qty=self.short_size,
+                qty=qty,
                 price=price,
             )
         elif direction == "bid-heavy":
             if position > 0:
                 return
+            qty = self.position_size
             if position < 0:
-                flattened = self._submit_order(
-                    alert_id=alert_id,
-                    symbol=symbol,
-                    direction=direction,
-                    side="COVER",
-                    qty=abs(position),
-                    price=price,
+                LOGGER.info(
+                    "Flipping short -> long in one order: buying %s shares (current=%s, target=%s)",
+                    abs(position) + self.position_size,
+                    position,
+                    self.position_size,
                 )
-                if not flattened:
-                    LOGGER.warning(
-                        "Skipping BUY on %s because closing COVER failed (alert %s)",
-                        symbol,
-                        alert_id,
-                    )
-                    return
+                qty += abs(position)
             self._submit_order(
                 alert_id=alert_id,
                 symbol=symbol,
                 direction=direction,
                 side="BUY",
-                qty=self.position_size,
+                qty=qty,
                 price=price,
             )
 
