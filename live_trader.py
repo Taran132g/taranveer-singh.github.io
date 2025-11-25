@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
@@ -231,24 +231,6 @@ class SchwabOrderExecutor:
             builder = builder_factory(symbol=symbol, quantity=qty)
         return self._send(builder, symbol=symbol, side=side.upper(), qty=qty)
 
-    def submit_limit(self, *, symbol: str, qty: int, side: str, limit_price: float) -> Dict[str, Optional[str]]:
-        builders = {
-            "BUY": equity_orders.equity_buy_limit,
-            "SELL": equity_orders.equity_sell_limit,
-            "SHORT": equity_orders.equity_sell_short_limit,
-            "COVER": equity_orders.equity_buy_to_cover_limit,
-        }
-        try:
-            builder_factory = builders[side.upper()]
-        except KeyError as exc:
-            raise ValueError(f"Unsupported side '{side}'") from exc
-
-        try:
-            builder = builder_factory(symbol, limit_price, qty)
-        except TypeError:
-            builder = builder_factory(symbol=symbol, price=limit_price, quantity=qty)
-        return self._send(builder, symbol=symbol, side=side.upper(), qty=qty)
-
     def cancel_all_orders(self) -> bool:
         """Attempt to cancel all open orders on the account."""
 
@@ -287,22 +269,11 @@ class LiveTrader:
         self.state_path = Path(os.getenv("LIVE_STATE_FILE", "live_trader_state.json"))
         self.executor = executor if executor is not None else SchwabOrderExecutor(dry_run=dry_run)
         self.dry_run = getattr(self.executor, "dry_run", dry_run)
-        self.prefer_limit_orders = _bool_env("LIVE_PREFER_LIMIT_ORDERS", True)
-        self.limit_slippage_bps = float(os.getenv("LIVE_LIMIT_SLIPPAGE_BPS", "10.0"))
         self.kill_switch_path = Path(os.getenv("LIVE_KILL_SWITCH_FILE", "kill_switch.flag"))
         self.max_trades_per_hour = int(os.getenv("LIVE_MAX_TRADES_PER_HOUR", "60"))
-        self.limit_fill_timeout = float(os.getenv("LIVE_LIMIT_FILL_TIMEOUT", "60"))
-        self.limit_fill_poll_interval = float(os.getenv("LIVE_LIMIT_FILL_POLL_INTERVAL", "2"))
-        self.limit_timeout_policy = os.getenv("LIVE_LIMIT_TIMEOUT_POLICY", "MARKET").upper()
-        if self.limit_timeout_policy not in {"ABANDON", "REPRICE", "MARKET"}:
-            LOGGER.warning("Invalid LIVE_LIMIT_TIMEOUT_POLICY '%s'; defaulting to MARKET", self.limit_timeout_policy)
-            self.limit_timeout_policy = "MARKET"
         self.positions: Dict[str, int] = {}
         self.last_alert_id = 0
         self.trade_timestamps: list[float] = []
-        # Track outstanding limits per symbol so we can reconcile fills or clear
-        # stale orders instead of blocking forever.
-        self.outstanding_limits: Dict[str, Dict[str, object]] = {}
         self._lock = threading.Lock()
 
         self._load_state()
@@ -452,148 +423,6 @@ class LiveTrader:
             self._record_fill(symbol=symbol, side=side, qty=delta)
         return filled_qty
 
-    def _reference_price(self, *, symbol: str, alert_price: float, side: Optional[str] = None) -> float:
-        quote = None
-        try:
-            quote = self.executor.fetch_quote(symbol)
-        except Exception as exc:  # pragma: no cover - defensive
-            LOGGER.warning("Quote refresh failed for %s: %s", symbol, exc)
-
-        if isinstance(quote, dict):
-            bid = quote.get("bidPrice") or quote.get("bid") or quote.get("bid_price")
-            ask = quote.get("askPrice") or quote.get("ask") or quote.get("ask_price")
-            last = quote.get("lastPrice") or quote.get("last") or quote.get("last_price")
-            ref: Optional[float] = None
-            try:
-                if side in {"BUY", "COVER"}:
-                    ref = float(ask) if ask not in {None, ""} else None
-                elif side in {"SELL", "SHORT"}:
-                    ref = float(bid) if bid not in {None, ""} else None
-            except (TypeError, ValueError):
-                ref = None
-
-            if ref is None:
-                try:
-                    ref = (float(bid) + float(ask)) / 2 if bid not in {None, ""} and ask not in {None, ""} else None
-                except Exception:
-                    ref = None
-
-            if ref is None:
-                try:
-                    ref = float(last) if last not in {None, ""} else None
-                except (TypeError, ValueError):
-                    ref = None
-
-            if ref is not None:
-                LOGGER.info(
-                    "Using refreshed quote for %s (bid=%s ask=%s last=%s -> ref=%s side=%s)",
-                    symbol,
-                    bid,
-                    ask,
-                    last,
-                    ref,
-                    side,
-                )
-                return ref
-
-        LOGGER.info("Using alert price as reference for %s due to missing quote", symbol)
-        return alert_price
-
-    def _aggressive_limit_price(self, *, side: str, reference_price: float) -> float:
-        if reference_price <= 0:
-            return reference_price
-
-        slip_fraction = max(self.limit_slippage_bps, 0.0) / 10000.0
-        if side in {"BUY", "COVER"}:
-            adjusted = reference_price * (1 + slip_fraction)
-        else:
-            adjusted = reference_price * (1 - slip_fraction)
-
-        adjusted = max(round(adjusted, 4), 0.01)
-
-        if adjusted != reference_price:
-            LOGGER.info(
-                "Limit price adjusted for slippage guard: %s -> %s (side=%s, %sbps)",
-                reference_price,
-                adjusted,
-                side,
-                self.limit_slippage_bps,
-            )
-
-        return adjusted
-
-    # ------------------------------------------------------------------
-    # Order + alert processing
-    # ------------------------------------------------------------------
-    def _poll_limit_fill(
-        self, *, order_id: str, symbol: str, side: str, qty: int, already_filled: int = 0
-    ) -> Tuple[bool, int, Optional[str]]:
-        start = time.time()
-        deadline = start + self.limit_fill_timeout
-        last_status: Optional[str] = None
-        filled_qty_seen = already_filled
-
-        filled_statuses = {
-            "FILLED",
-            "FILLED_ALL",
-            "FILLED_ALL_SHARES",
-            "EXECUTED",
-            "COMPLETED",
-            "FILLED_ALL_LOTS",
-        }
-        terminal_reject_statuses = {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}
-        partial_statuses = {"PARTIALLY_FILLED", "PARTIAL_FILL", "WORKING", "ACCEPTED", "QUEUED"}
-
-        while time.time() < deadline:
-            status = self.executor.fetch_order_status(order_id)
-            last_status = (status.get("status") or "").upper()
-            LOGGER.debug("Poll status for %s: %s", order_id, status.get("raw") or status)
-
-            if status.get("error"):
-                LOGGER.warning(
-                    "Unable to poll order %s for %s %s %s: %s",
-                    order_id,
-                    side,
-                    qty,
-                    symbol,
-                    status.get("error"),
-                )
-                break
-
-            filled_quantity = status.get("filled_quantity")
-            try:
-                filled_quantity = int(float(filled_quantity)) if filled_quantity is not None else None
-            except (TypeError, ValueError):
-                filled_quantity = None
-
-            if filled_quantity is not None:
-                filled_qty_seen = self._apply_filled_delta(
-                    symbol=symbol, side=side, qty=qty, filled_qty=filled_quantity, filled_qty_seen=filled_qty_seen
-                )
-
-            if last_status in filled_statuses:
-                if filled_qty_seen < qty:
-                    self._record_fill(symbol=symbol, side=side, qty=qty - filled_qty_seen)
-                    filled_qty_seen = qty
-                LOGGER.info("Limit order %s filled for %s %s %s", order_id, side, qty, symbol)
-                return True, filled_qty_seen, last_status
-
-            if last_status in terminal_reject_statuses:
-                LOGGER.warning("Limit order %s ended with status %s", order_id, last_status)
-                return False, filled_qty_seen, last_status
-
-            if last_status in partial_statuses and filled_qty_seen >= qty:
-                return True, filled_qty_seen, last_status
-
-            time.sleep(self.limit_fill_poll_interval)
-
-        LOGGER.warning(
-            "Timed out waiting for limit order %s to fill (last_status=%s)",
-            order_id,
-            last_status,
-        )
-        return False, filled_qty_seen, last_status or "TIMEOUT"
-
     def _enforce_trade_rate_limit(self) -> None:
         cutoff = time.time() - 3600
         self.trade_timestamps = [ts for ts in self.trade_timestamps if ts >= cutoff]
@@ -623,7 +452,6 @@ class LiveTrader:
                 side=side,
                 qty=abs(qty),
                 price=price,
-                force_market=True,
             )
 
         self._save_state()
@@ -663,86 +491,6 @@ class LiveTrader:
             )
             conn.commit()
 
-    def _reconcile_outstanding_limit(self, symbol: str) -> bool:
-        entry = self.outstanding_limits.get(symbol)
-        if not entry:
-            return False
-
-        order_id = str(entry.get("order_id"))
-        qty = int(entry.get("qty") or 0)
-        side = str(entry.get("side") or "").upper()
-        filled_seen = int(entry.get("filled_seen") or 0)
-        cancel_attempts = int(entry.get("cancel_attempts") or 0)
-
-        status = self.executor.fetch_order_status(order_id)
-        status_name = (status.get("status") or "").upper()
-        filled_quantity = status.get("filled_quantity")
-        try:
-            filled_quantity = int(float(filled_quantity)) if filled_quantity is not None else None
-        except (TypeError, ValueError):
-            filled_quantity = None
-
-        filled_statuses = {"FILLED", "FILLED_ALL", "FILLED_ALL_SHARES", "EXECUTED", "COMPLETED", "FILLED_ALL_LOTS"}
-        terminal_reject_statuses = {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}
-
-        if filled_quantity is not None and qty > 0:
-            filled_seen = self._apply_filled_delta(
-                symbol=symbol, side=side, qty=qty, filled_qty=filled_quantity, filled_qty_seen=filled_seen
-            )
-            entry["filled_seen"] = filled_seen
-
-        if status_name in filled_statuses:
-            self.outstanding_limits.pop(symbol, None)
-            return False
-
-        if status_name in terminal_reject_statuses:
-            self.outstanding_limits.pop(symbol, None)
-            return False
-
-        age = time.time() - float(entry.get("since", time.time()))
-        if status.get("error") and age > self.limit_fill_timeout:
-            LOGGER.warning(
-                "Outstanding limit %s for %s has status error '%s'; attempting cancel after %.1fs",
-                order_id,
-                symbol,
-                status.get("error"),
-                age,
-            )
-            status_name = "UNKNOWN"
-        if age > self.limit_fill_timeout:
-            LOGGER.warning(
-                "Outstanding limit %s for %s still %s after %.1fs; attempting cancel", order_id, symbol, status_name, age
-            )
-            cancelled = self.executor.cancel_order(order_id)
-            status_after = self.executor.fetch_order_status(order_id)
-            status_after_name = (status_after.get("status") or "").upper()
-            post_filled = status_after.get("filled_quantity")
-            try:
-                post_filled_int = int(float(post_filled)) if post_filled is not None else None
-            except (TypeError, ValueError):
-                post_filled_int = None
-
-            if post_filled_int is not None and qty > 0:
-                filled_seen = self._apply_filled_delta(
-                    symbol=symbol, side=side, qty=qty, filled_qty=post_filled_int, filled_qty_seen=filled_seen
-                )
-                entry["filled_seen"] = filled_seen
-
-            if cancelled or status_after_name in terminal_reject_statuses or status_after_name in filled_statuses:
-                self.outstanding_limits.pop(symbol, None)
-                return False
-            entry["since"] = time.time()
-            entry["cancel_attempts"] = cancel_attempts + 1
-            if entry["cancel_attempts"] >= 3:
-                LOGGER.warning(
-                    "Exceeded cancel attempts for %s; clearing outstanding guard to avoid permanent block",
-                    symbol,
-                )
-                self.outstanding_limits.pop(symbol, None)
-                return False
-
-        return True
-
     def _submit_order(
         self,
         *,
@@ -752,37 +500,8 @@ class LiveTrader:
         side: str,
         qty: int,
         price: float,
-        force_market: bool = False,
     ) -> bool:
-        # Decide whether to chase the best price (limit) or guaranteed speed
-        # (market). When we pick limit, we still backstop with a market order
-        # if the limit cannot be submitted. Returns True only when the order is
-        # accepted and, for limits, actually filled.
-        reference_price = self._reference_price(symbol=symbol, alert_price=price, side=side)
-        use_limit = self.prefer_limit_orders and not force_market
-        effective_price = (
-            self._aggressive_limit_price(side=side, reference_price=reference_price)
-            if use_limit
-            else reference_price
-        )
-
-        result = (
-            self.executor.submit_limit(symbol=symbol, qty=qty, side=side, limit_price=effective_price)
-            if use_limit
-            else None
-        )
-        if use_limit and result and result.get("error"):
-            LOGGER.warning(
-                "Limit order for %s %s failed (%s); falling back to market as emergency",
-                side,
-                symbol,
-                result.get("error"),
-            )
-            use_limit = False
-            result = None
-
-        if result is None:
-            result = self.executor.submit_market(symbol=symbol, qty=qty, side=side)
+        result = self.executor.submit_market(symbol=symbol, qty=qty, side=side)
 
         submitted = result.get("error") is None and (
             result.get("dry_run")
@@ -795,166 +514,13 @@ class LiveTrader:
         filled = False
         fill_status: Optional[str] = None
         filled_qty = 0
-        self.outstanding_limits.pop(symbol, None)
 
         if submitted:
-            if result.get("dry_run") or not use_limit:
-                self._record_fill(symbol=symbol, side=side, qty=qty)
-                filled = True
-                filled_qty = qty
-                fill_status = "FILLED"
-                result["filled_via"] = "MARKET" if not use_limit else "LIMIT"
-            else:
-                order_id = result.get("order_id")
-                if not order_id:
-                    LOGGER.warning("No order_id returned for limit order; cannot poll for fills")
-                    fill_status = "FAILED"
-                else:
-                    LOGGER.info(
-                        "Limit order accepted for %s %s %s at %s; awaiting fill",
-                        side,
-                        qty,
-                        symbol,
-                        effective_price,
-                    )
-                    self.outstanding_limits[symbol] = {
-                        "order_id": order_id,
-                        "since": time.time(),
-                        "side": side,
-                        "qty": qty,
-                        "filled_seen": 0,
-                        "cancel_attempts": 0,
-                    }
-                    poll_success, filled_qty, last_status = self._poll_limit_fill(
-                        order_id=order_id, symbol=symbol, side=side, qty=qty
-                    )
-                    filled = poll_success
-                    fill_status = "FILLED" if poll_success else last_status or "FAILED"
-                    if poll_success:
-                        self.outstanding_limits.pop(symbol, None)
-                        result["filled_via"] = "LIMIT"
-                    if not poll_success:
-                        cancelled = self.executor.cancel_order(order_id)
-                        status_after_cancel = self.executor.fetch_order_status(order_id)
-                        if status_after_cancel.get("filled_quantity") is not None:
-                            try:
-                                post_filled = int(float(status_after_cancel.get("filled_quantity")))
-                            except (TypeError, ValueError):
-                                post_filled = filled_qty
-                            filled_qty = self._apply_filled_delta(
-                                symbol=symbol,
-                                side=side,
-                                qty=qty,
-                                filled_qty=post_filled,
-                                filled_qty_seen=filled_qty,
-                            )
-                        if cancelled:
-                            self.outstanding_limits.pop(symbol, None)
-                        else:
-                            LOGGER.warning(
-                                "Unable to cancel unfilled order %s for %s; tracking as open",
-                                order_id,
-                                symbol,
-                            )
-                            self.outstanding_limits[symbol] = {
-                                "order_id": order_id,
-                                "since": time.time(),
-                                "side": side,
-                                "qty": qty,
-                                "filled_seen": filled_qty,
-                                "cancel_attempts": 1,
-                            }
-
-                        remaining_qty = max(qty - filled_qty, 0)
-                        result["timeout_policy"] = self.limit_timeout_policy
-                        if remaining_qty > 0 and cancelled:
-                            if self.limit_timeout_policy == "REPRICE":
-                                new_price = self._aggressive_limit_price(
-                                    side=side,
-                                    reference_price=self._reference_price(
-                                        symbol=symbol, alert_price=reference_price, side=side
-                                    ),
-                                )
-                                LOGGER.info(
-                                    "Repricing %s %s %s after timeout to %s",
-                                    side,
-                                    remaining_qty,
-                                    symbol,
-                                    new_price,
-                                )
-                                result["fallback"] = self.executor.submit_limit(
-                                    symbol=symbol, qty=remaining_qty, side=side, limit_price=new_price
-                                )
-                                if result["fallback"].get("error"):
-                                    LOGGER.warning(
-                                        "Repriced limit failed for %s %s %s: %s",
-                                        side,
-                                        remaining_qty,
-                                        symbol,
-                                        result["fallback"].get("error"),
-                                    )
-                                    result["fallback_fill_status"] = "FAILED"
-                                else:
-                                    fallback_id = result["fallback"].get("order_id")
-                                    if fallback_id:
-                                        self.outstanding_limits[symbol] = {
-                                            "order_id": fallback_id,
-                                            "since": time.time(),
-                                            "side": side,
-                                            "qty": remaining_qty,
-                                            "filled_seen": filled_qty,
-                                            "cancel_attempts": 0,
-                                        }
-                                        result["fallback_fill_status"] = "SUBMITTED"
-                                        repoll_success, repoll_filled, repoll_status = self._poll_limit_fill(
-                                            order_id=fallback_id,
-                                            symbol=symbol,
-                                            side=side,
-                                            qty=remaining_qty,
-                                            already_filled=0,
-                                        )
-                                        filled_qty += repoll_filled
-                                        filled = repoll_success
-                                        if repoll_success:
-                                            result["filled_via"] = "REPRICE_LIMIT"
-                                            self.outstanding_limits.pop(symbol, None)
-                                            fill_status = "FILLED"
-                                        else:
-                                            result["fallback_fill_status"] = repoll_status or "FAILED"
-                                            fill_status = repoll_status or fill_status
-                                    else:
-                                        LOGGER.warning(
-                                            "Repriced limit for %s %s %s returned no order_id; skipping repoll",
-                                            side,
-                                            remaining_qty,
-                                            symbol,
-                                        )
-                                        result["fallback_fill_status"] = "FAILED"
-                            elif self.limit_timeout_policy == "MARKET":
-                                LOGGER.info(
-                                    "Timeout policy MARKET: sending market for remaining %s %s",
-                                    remaining_qty,
-                                    symbol,
-                                )
-                                fallback = self.executor.submit_market(symbol=symbol, qty=remaining_qty, side=side)
-                                result["fallback"] = fallback
-                                fallback_ok = fallback.get("error") is None and (
-                                    fallback.get("dry_run")
-                                    or (fallback.get("status_code") and str(fallback.get("status_code")).startswith("2"))
-                                )
-                                if fallback_ok:
-                                    self._record_fill(symbol=symbol, side=side, qty=remaining_qty)
-                                    filled = True
-                                    fill_status = "FILLED"
-                                    filled_qty = qty
-                                    result["filled_via"] = "MARKET_FALLBACK"
-                                else:
-                                    result["fallback_fill_status"] = "FAILED"
-                            else:
-                                LOGGER.info("Timeout policy ABANDON: leaving remaining qty unfilled")
-                        elif remaining_qty == 0:
-                            filled = True
-                            fill_status = "FILLED"
+            self._record_fill(symbol=symbol, side=side, qty=qty)
+            filled = True
+            filled_qty = qty
+            fill_status = "FILLED"
+            result["filled_via"] = "MARKET"
         else:
             fill_status = "FAILED"
 
@@ -970,28 +536,19 @@ class LiveTrader:
             direction=direction,
             side=side,
             qty=qty,
-            price=effective_price,
+            price=price,
             result=result,
         )
         return filled
 
     def _handle_alert(self, alert_id: int, symbol: str, direction: str, price: float) -> None:
-        if symbol in self.outstanding_limits:
-            still_blocked = self._reconcile_outstanding_limit(symbol)
-            if still_blocked:
-                LOGGER.warning(
-                    "Outstanding limit order %s for %s; skipping alert %s to avoid double exposure",
-                    self.outstanding_limits[symbol],
-                    symbol,
-                    alert_id,
-                )
-                return
-
         position = self.positions.get(symbol, 0)
 
         if direction == "ask-heavy":
             if position < 0:
+                LOGGER.info("Already short %s; skip stacking", symbol)
                 return
+
             if position > 0:
                 flattened = self._submit_order(
                     alert_id=alert_id,
@@ -1008,6 +565,7 @@ class LiveTrader:
                         alert_id,
                     )
                     return
+
             self._submit_order(
                 alert_id=alert_id,
                 symbol=symbol,
@@ -1018,7 +576,9 @@ class LiveTrader:
             )
         elif direction == "bid-heavy":
             if position > 0:
+                LOGGER.info("Already long %s; skip stacking", symbol)
                 return
+
             if position < 0:
                 flattened = self._submit_order(
                     alert_id=alert_id,
@@ -1035,6 +595,7 @@ class LiveTrader:
                         alert_id,
                     )
                     return
+
             self._submit_order(
                 alert_id=alert_id,
                 symbol=symbol,
