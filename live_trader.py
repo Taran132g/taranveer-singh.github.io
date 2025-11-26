@@ -268,6 +268,11 @@ class LiveTrader:
         self.flip_size = int(os.getenv("LIVE_FLIP_SIZE", str(self.initial_entry_size * 2)))
         self.poll_interval = float(os.getenv("LIVE_POLL_INTERVAL", "1"))
         self.state_path = Path(os.getenv("LIVE_STATE_FILE", "live_trader_state.json"))
+        self.prefer_limit_orders = _bool_env("LIVE_PREFER_LIMIT_ORDERS", False)
+        self.limit_slippage_bps = float(os.getenv("LIVE_LIMIT_SLIPPAGE_BPS", "10"))
+        self.limit_fill_timeout = float(os.getenv("LIVE_LIMIT_FILL_TIMEOUT", "0"))
+        self.limit_poll_interval = float(os.getenv("LIVE_LIMIT_FILL_POLL_INTERVAL", "0.05"))
+        self.limit_timeout_policy = os.getenv("LIVE_LIMIT_TIMEOUT_POLICY", "MARKET").upper()
         self.executor = executor if executor is not None else SchwabOrderExecutor(dry_run=dry_run)
         self.dry_run = getattr(self.executor, "dry_run", dry_run)
         self.kill_switch_path = Path(os.getenv("LIVE_KILL_SWITCH_FILE", "kill_switch.flag"))
@@ -275,6 +280,7 @@ class LiveTrader:
         self.positions: Dict[str, int] = {}
         self.last_alert_id = 0
         self.trade_timestamps: list[float] = []
+        self.outstanding_limits: Dict[str, dict] = {}
         self._lock = threading.Lock()
 
         self._load_state()
@@ -376,6 +382,32 @@ class LiveTrader:
             )
             row = cur.fetchone()
             return float(row[0]) if row else None
+
+    def _aggressive_limit_price(self, *, side: str, reference_price: float) -> float:
+        """Pad limit prices toward the touch to improve fill odds."""
+
+        bps = self.limit_slippage_bps / 10_000
+        if side.upper() in {"BUY", "COVER"}:
+            return reference_price * (1 + bps)
+        return reference_price * (1 - bps)
+
+    def _reference_price(self, symbol: str, direction: str, fallback: float) -> float:
+        quote = None
+        try:
+            quote = self.executor.fetch_quote(symbol)
+        except Exception:
+            quote = None
+
+        if quote:
+            if direction == "ask-heavy":
+                for key in ("bidPrice", "lastPrice", "askPrice"):
+                    if key in quote and quote[key] not in {None, 0}:
+                        return float(quote[key])
+            else:
+                for key in ("askPrice", "lastPrice", "bidPrice"):
+                    if key in quote and quote[key] not in {None, 0}:
+                        return float(quote[key])
+        return float(fallback)
 
     # ------------------------------------------------------------------
     # Position bookkeeping
@@ -491,19 +523,10 @@ class LiveTrader:
                 ),
             )
             conn.commit()
-
-    def _submit_order(
-        self,
-        *,
-        alert_id: int,
-        symbol: str,
-        direction: str,
-        side: str,
-        qty: int,
-        price: float,
+    def _record_and_apply_market(
+        self, *, alert_id: int, symbol: str, direction: str, side: str, qty: int, price: float
     ) -> bool:
         result = self.executor.submit_market(symbol=symbol, qty=qty, side=side)
-
         submitted = result.get("error") is None and (
             result.get("dry_run")
             or (
@@ -513,8 +536,8 @@ class LiveTrader:
         )
 
         filled = False
-        fill_status: Optional[str] = None
         filled_qty = 0
+        fill_status: Optional[str] = None
 
         if submitted:
             self._record_fill(symbol=symbol, side=side, qty=qty)
@@ -542,6 +565,131 @@ class LiveTrader:
         )
         return filled
 
+    def _submit_order(
+        self,
+        *,
+        alert_id: int,
+        symbol: str,
+        direction: str,
+        side: str,
+        qty: int,
+        price: float,
+    ) -> bool:
+        if self.prefer_limit_orders:
+            return self._submit_with_limit(
+                alert_id=alert_id,
+                symbol=symbol,
+                direction=direction,
+                side=side,
+                qty=qty,
+                reference_price=price,
+            )
+        return self._record_and_apply_market(
+            alert_id=alert_id,
+            symbol=symbol,
+            direction=direction,
+            side=side,
+            qty=qty,
+            price=price,
+        )
+
+    def _submit_with_limit(
+        self,
+        *,
+        alert_id: int,
+        symbol: str,
+        direction: str,
+        side: str,
+        qty: int,
+        reference_price: float,
+        allow_reprice: bool = True,
+    ) -> bool:
+        limit_price = self._aggressive_limit_price(side=side, reference_price=reference_price)
+        result = self.executor.submit_limit(symbol=symbol, qty=qty, side=side, limit_price=limit_price)
+        order_id = result.get("order_id")
+        if order_id:
+            self.outstanding_limits[order_id] = {"symbol": symbol, "side": side, "qty": qty}
+
+        filled_qty_seen = 0
+        filled = False
+        start = time.time()
+
+        while order_id and self.limit_fill_timeout > 0:
+            status = self.executor.fetch_order_status(order_id)
+            filled_qty = status.get("filled_quantity") if isinstance(status, dict) else None
+            status_value = (status.get("status") or "").upper() if isinstance(status, dict) else ""
+
+            if filled_qty is None and status_value == "FILLED":
+                filled_qty = qty
+
+            if filled_qty is not None:
+                filled_qty_seen = self._apply_filled_delta(
+                    symbol=symbol,
+                    side=side,
+                    qty=qty,
+                    filled_qty=int(filled_qty),
+                    filled_qty_seen=filled_qty_seen,
+                )
+                if filled_qty_seen >= qty:
+                    filled = True
+                    break
+
+            if time.time() - start >= self.limit_fill_timeout:
+                break
+            time.sleep(self.limit_poll_interval)
+
+        result["fill_status"] = "FILLED" if filled else "PENDING"
+        result["filled_qty"] = filled_qty_seen
+
+        self._record_order(
+            alert_id=alert_id,
+            symbol=symbol,
+            direction=direction,
+            side=side,
+            qty=qty,
+            price=limit_price,
+            result=result,
+        )
+
+        if filled:
+            if order_id:
+                self.outstanding_limits.pop(order_id, None)
+            return True
+
+        timeout_policy = self.limit_timeout_policy
+        if self.limit_fill_timeout == 0:
+            timeout_policy = "NONE"
+
+        if timeout_policy == "MARKET":
+            if order_id:
+                self.executor.cancel_order(order_id)
+                self.outstanding_limits.pop(order_id, None)
+            return self._record_and_apply_market(
+                alert_id=alert_id,
+                symbol=symbol,
+                direction=direction,
+                side=side,
+                qty=qty,
+                price=reference_price,
+            )
+
+        if timeout_policy == "REPRICE" and allow_reprice:
+            if order_id:
+                self.executor.cancel_order(order_id)
+                self.outstanding_limits.pop(order_id, None)
+            refreshed = self._reference_price(symbol, direction, reference_price)
+            return self._submit_with_limit(
+                alert_id=alert_id,
+                symbol=symbol,
+                direction=direction,
+                side=side,
+                qty=qty,
+                reference_price=refreshed,
+                allow_reprice=False,
+            )
+
+        return False
+
     def _handle_alert(self, alert_id: int, symbol: str, direction: str, price: float) -> None:
         position = self.positions.get(symbol, 0)
 
@@ -563,8 +711,17 @@ class LiveTrader:
             if position > 0:
                 LOGGER.info("Already long %s; skip stacking", symbol)
                 return
+            if position < 0:
+                self._submit_order(
+                    alert_id=alert_id,
+                    symbol=symbol,
+                    direction=direction,
+                    side="COVER",
+                    qty=abs(position),
+                    price=price,
+                )
 
-            qty = self.flip_size if position < 0 else self.initial_entry_size
+            qty = self.initial_entry_size
             self._submit_order(
                 alert_id=alert_id,
                 symbol=symbol,
@@ -591,7 +748,8 @@ class LiveTrader:
         """
         with self._lock:
             self.last_alert_id = max(self.last_alert_id, int(alert_id))
-            self._handle_alert(alert_id, symbol, direction, price)
+            reference_price = self._reference_price(symbol, direction, price)
+            self._handle_alert(alert_id, symbol, direction, reference_price)
             if persist_state and not self.dry_run:
                 self._save_state()
 
