@@ -25,9 +25,11 @@ class PaperTrader:
     """
 
     def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.dry_run = True
         self.load_state()
-        self.last_alert_id = self._get_last_alert_id()
         self._init_db_schema()
+        self.last_alert_id = self._get_last_alert_id()
 
         # === Daily PnL tracking ===
         self.daily_pnl = 0.0
@@ -101,14 +103,29 @@ class PaperTrader:
                 )
             """)
 
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS paper_seen_prices (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    alert_id INTEGER,
+                    symbol TEXT,
+                    direction TEXT,
+                    price REAL,
+                    seen_at REAL DEFAULT (strftime('%s','now'))
+                )
+            """)
+
             conn.commit()
 
     def _get_last_alert_id(self) -> int:
         with self._open_conn() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT MAX(rowid) FROM alerts")
-            row = cur.fetchone()
-            return row[0] if row and row[0] else 0
+            try:
+                cur.execute("SELECT MAX(rowid) FROM alerts")
+                row = cur.fetchone()
+                return row[0] if row and row[0] else 0
+            except sqlite3.OperationalError:
+                # Some test setups use a fresh DB without the alerts table; start from 0.
+                return 0
 
     def _get_current_price(self, symbol: str) -> float:
         with self._open_conn() as conn:
@@ -264,6 +281,60 @@ class PaperTrader:
     # ============================================================
     # FLIP-ONLY ALERT LOGIC
     # ============================================================
+    def _handle_alert(self, alert_id: int, symbol: str, direction: str, price: float) -> None:
+        """Core flip-only logic shared by inline + DB polling paths."""
+
+        self._record_seen_price(alert_id=alert_id, symbol=symbol, direction=direction, price=price)
+
+        pos = self.positions.get(symbol, {})
+        current_qty = pos.get("qty", 0)
+
+        # ASK-HEAVY → SHORT
+        if direction == "ask-heavy":
+            if current_qty > 0:  # flip long → short
+                self._sell(symbol, current_qty, price)
+                self._short(symbol, SHORT_SIZE, price)
+            elif current_qty == 0:  # open new short
+                self._short(symbol, SHORT_SIZE, price)
+
+        # BID-HEAVY → LONG
+        elif direction == "bid-heavy":
+            if current_qty < 0:  # flip short → long
+                self._cover(symbol, abs(current_qty), price)
+                self._buy(symbol, POSITION_SIZE, price)
+            elif current_qty == 0:  # open new long
+                self._buy(symbol, POSITION_SIZE, price)
+
+        # Update current price and PnL even when no trade is executed
+        self._update_position_db(symbol, cur_price=price)
+
+    def _record_seen_price(self, alert_id: int, symbol: str, direction: str, price: float) -> None:
+        """Persist the Schwab quote we acted on so we can audit simulated fills."""
+
+        print(
+            f"[PAPER] Alert {alert_id} {symbol} {direction} @ ${price:.4f} (Schwab quote)",
+            flush=True,
+        )
+
+        with self._open_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO paper_seen_prices (alert_id, symbol, direction, price)
+                VALUES (?, ?, ?, ?)
+                """,
+                (alert_id, symbol, direction, price),
+            )
+            conn.commit()
+
+    def process_alert(self, alert_id: int, symbol: str, direction: str, price: float) -> None:
+        """Expose inline hook so grok can dispatch alerts directly."""
+
+        with self._lock:
+            self.last_alert_id = max(self.last_alert_id, int(alert_id))
+            self._handle_alert(alert_id, symbol, direction, price)
+            self.save_state()
+
     def monitor_alerts(self):
         print("[PAPER] Monitoring alerts (Flip-Only Mode)…", flush=True)
 
@@ -301,29 +372,7 @@ class PaperTrader:
 
             for row in rows:
                 alert_id, symbol, direction, price = row
-                self.last_alert_id = alert_id
-
-                pos = self.positions.get(symbol, {})
-                current_qty = pos.get("qty", 0)
-
-                # ASK-HEAVY → SHORT
-                if direction == "ask-heavy":
-                    if current_qty > 0:  # flip long → short
-                        self._sell(symbol, current_qty, price)
-                        self._short(symbol, SHORT_SIZE, price)
-                    elif current_qty == 0:  # open new short
-                        self._short(symbol, SHORT_SIZE, price)
-
-                # BID-HEAVY → LONG
-                elif direction == "bid-heavy":
-                    if current_qty < 0:  # flip short → long
-                        self._cover(symbol, abs(current_qty), price)
-                        self._buy(symbol, POSITION_SIZE, price)
-                    elif current_qty == 0:  # open new long
-                        self._buy(symbol, POSITION_SIZE, price)
-
-                # Update current price and PnL even when no trade is executed
-                self._update_position_db(symbol, cur_price=price)
+                self.process_alert(alert_id, symbol, direction, price)
 
             activity_detected = bool(rows)
 

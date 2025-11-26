@@ -803,6 +803,10 @@ async def main():
     DB_PATH = args.db_path if args.db_path is not None else os.getenv("DB_PATH", "penny_basing.db")
     os.environ["DB_PATH"] = str(DB_PATH)
     inline_only_requested = _bool_env("INLINE_DISPATCH_ONLY", False)
+    inline_dry_run = _bool_env(
+        "INLINE_DRY_RUN",
+        _bool_env("INLINE_LIVE_DRY_RUN", _bool_env("LIVE_DRY_RUN", False)),
+    )
     # if args.symbols:
     #     SYMBOLS = [s.strip().upper() for s in args.symbols.replace(" ", ",").split(",") if s.strip()]
     # else:
@@ -851,9 +855,16 @@ async def main():
     inline_trader_dispatch = None
     inline_only_mode = False
     try:
-        from live_trader import LiveTrader
+        trader_kind = "live"
+        if inline_dry_run:
+            from paper_trader import PaperTrader
 
-        inline_trader = LiveTrader(dry_run=_bool_env("INLINE_LIVE_DRY_RUN", False))
+            inline_trader = PaperTrader()
+            trader_kind = "paper"
+        else:
+            from live_trader import LiveTrader
+
+            inline_trader = LiveTrader(dry_run=False)
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue(maxsize=_get_int_env("INLINE_TRADER_QUEUE", 100, 10))
         worker_count = _get_int_env("INLINE_TRADER_WORKERS", 1, 1)
@@ -901,7 +912,11 @@ async def main():
                 return False
 
         inline_only_mode = inline_only_requested
-        inline_log = {"status": "enabled", "dry_run": inline_trader.dry_run}
+        inline_log = {
+            "status": "enabled",
+            "dry_run": getattr(inline_trader, "dry_run", inline_dry_run),
+            "trader": trader_kind,
+        }
         if inline_only_mode:
             inline_log["mode"] = "inline_only"
         log_structured("INLINE_TRADER", inline_log)
