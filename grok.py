@@ -803,10 +803,10 @@ async def main():
     DB_PATH = args.db_path if args.db_path is not None else os.getenv("DB_PATH", "penny_basing.db")
     os.environ["DB_PATH"] = str(DB_PATH)
     inline_only_requested = _bool_env("INLINE_DISPATCH_ONLY", False)
-    if args.symbols:
-        SYMBOLS = [s.strip().upper() for s in args.symbols.replace(" ", ",").split(",") if s.strip()]
-    else:
-        SYMBOLS = _parse_symbols_from_env("SYMBOLS", "F")
+    # if args.symbols:
+    #     SYMBOLS = [s.strip().upper() for s in args.symbols.replace(" ", ",").split(",") if s.strip()]
+    # else:
+    SYMBOLS = _parse_symbols_from_env("SYMBOLS", "F")
     DISABLE_BID_HEAVY = bool(args.disable_bid_heavy)
     DEBUG_BOOK_RAW = bool(args.debug_book_raw)
     JSON_BOOK = bool(args.json_book)
