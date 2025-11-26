@@ -264,7 +264,8 @@ class LiveTrader:
     def __init__(self, *, dry_run: bool = False, executor: Optional[SchwabOrderExecutor] = None) -> None:
         self.db_path = Path(os.getenv("DB_PATH", "penny_basing.db"))
         self.position_size = int(os.getenv("LIVE_POSITION_SIZE", os.getenv("POSITION_SIZE", "5000")))
-        self.short_size = int(os.getenv("LIVE_SHORT_SIZE", os.getenv("SHORT_SIZE", str(self.position_size))))
+        self.initial_entry_size = int(os.getenv("LIVE_INITIAL_SIZE", str(self.position_size)))
+        self.flip_size = int(os.getenv("LIVE_FLIP_SIZE", str(self.initial_entry_size * 2)))
         self.poll_interval = float(os.getenv("LIVE_POLL_INTERVAL", "1"))
         self.state_path = Path(os.getenv("LIVE_STATE_FILE", "live_trader_state.json"))
         self.executor = executor if executor is not None else SchwabOrderExecutor(dry_run=dry_run)
@@ -549,29 +550,13 @@ class LiveTrader:
                 LOGGER.info("Already short %s; skip stacking", symbol)
                 return
 
-            if position > 0:
-                flattened = self._submit_order(
-                    alert_id=alert_id,
-                    symbol=symbol,
-                    direction=direction,
-                    side="SELL",
-                    qty=position,
-                    price=price,
-                )
-                if not flattened:
-                    LOGGER.warning(
-                        "Skipping SHORT on %s because closing SELL failed (alert %s)",
-                        symbol,
-                        alert_id,
-                    )
-                    return
-
+            qty = self.flip_size if position > 0 else self.initial_entry_size
             self._submit_order(
                 alert_id=alert_id,
                 symbol=symbol,
                 direction=direction,
                 side="SHORT",
-                qty=self.short_size,
+                qty=qty,
                 price=price,
             )
         elif direction == "bid-heavy":
@@ -579,29 +564,13 @@ class LiveTrader:
                 LOGGER.info("Already long %s; skip stacking", symbol)
                 return
 
-            if position < 0:
-                flattened = self._submit_order(
-                    alert_id=alert_id,
-                    symbol=symbol,
-                    direction=direction,
-                    side="COVER",
-                    qty=abs(position),
-                    price=price,
-                )
-                if not flattened:
-                    LOGGER.warning(
-                        "Skipping BUY on %s because closing COVER failed (alert %s)",
-                        symbol,
-                        alert_id,
-                    )
-                    return
-
+            qty = self.flip_size if position < 0 else self.initial_entry_size
             self._submit_order(
                 alert_id=alert_id,
                 symbol=symbol,
                 direction=direction,
                 side="BUY",
-                qty=self.position_size,
+                qty=qty,
                 price=price,
             )
 
