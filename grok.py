@@ -1,3 +1,20 @@
+"""
+Beginner-friendly overview
+-------------------------
+This file is the "brain" of the alerting pipeline. It does four things:
+1) Reads config from the environment/CLI so you can tune symbols and thresholds.
+2) Streams live market data from Schwab, cleaning it up into simple Python
+   dicts.
+3) Decides when an imbalance is "ask-heavy" or "bid-heavy" and writes that
+   alert into a small SQLite database.
+4) Immediately hands each alert to the in-process LiveTrader so trades can
+   fire without waiting on a slower polling loop.
+
+The comments scattered through the file aim to explain each stage in plain
+language rather than trading jargon. Feel free to scroll to the section you
+care about; each header notes what it controls.
+"""
+
 import os
 import sys
 import argparse
@@ -17,13 +34,19 @@ from schwab.client import Client
 from schwab.streaming import StreamClient
 
 # Configure Logging
+# Keep log lines structured and timestamped so you can follow what happened
+# without digging through print statements.
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+# Small helper: print a JSON line with a consistent shape so humans and tools
+# can read it easily. Warnings are elevated when they relate to alerts.
 def log_structured(event: str, data: dict):
     level = logging.INFO if event != "ALERT" else logging.WARNING
     logging.log(level, json.dumps({"event": event, **data}))
 
 # Exchange Code Mapping
+# Schwab sends short exchange codes; this map turns them into readable names
+# before we evaluate order-book imbalances.
 EXCHANGE_MAP = {
     "NYSE": "NYSE",
     "MEMX": "MEMX",
@@ -44,6 +67,8 @@ EXCHANGE_MAP = {
 }
 
 # Helpers
+# Environment + parsing utilities so the rest of the file can assume clean
+# inputs (no need to remember how each env var is formatted).
 def _normalize_and_validate_callback(url: str) -> str:
     if not url:
         raise ValueError("SCHWAB_REDIRECT_URI is empty")
@@ -61,6 +86,12 @@ def _get_int_env(name: str, default: int, minimum: int = 1) -> int:
     except ValueError:
         return max(default, minimum)
     return max(val, minimum)
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 def _get_float_env(name: str, default: float, minimum: float = 0.0) -> float:
     raw = os.getenv(name)
@@ -84,6 +115,8 @@ def _parse_symbols_from_env(var_name: str = "SYMBOLS", fallback: str = "F") -> L
     return out
 
 # Book Processing
+# Convert the raw level-2 order book into bid/ask lists we can count. This is
+# the heart of the imbalance detection logic.
 class _Row(TypedDict, total=False):
     EX: str
     SIZE: int
@@ -286,6 +319,9 @@ def process_book(book: _Book, sym: str) -> BookMetrics:
     )
 
 # Trade Data Structures
+# Global knobs and rolling state that track how many heavy venues exist and
+# when an alert was last triggered. Most users only tweak the constants near
+# the top of this section.
 SYMBOLS: List[str] = []
 WINDOW_SECONDS: int = 60
 HEARTBEAT_SEC: int = 5
@@ -320,6 +356,14 @@ _chart_debug_remaining: Dict[str, int] = defaultdict(lambda: 10)
 _timesale_debug_remaining: Dict[str, int] = defaultdict(lambda: 10)
 _last_chart_or_timesale_ts: Dict[str, float] = defaultdict(float)
 _last_volume_fallback_ts: Dict[str, float] = defaultdict(float)
+# Inline live trader hook
+# -----------------------
+# When grok writes a new alert to SQLite, it also forwards that alert directly
+# to LiveTrader in the same process. This keeps latency as low as possible and
+# avoids waiting for a separate polling script.
+inline_trader_dispatch = None
+inline_only_mode: bool = False
+inline_only_next_alert_id: int = 0
 
 @dataclass
 class Trade:
@@ -371,6 +415,8 @@ def _summarize(sym: str, now: float):
     return vol_per_min
 
 # Handlers
+# Callback functions triggered by Schwab streaming events. Each one updates the
+# rolling state and may emit alerts when conditions are met.
 def on_level1(msg: dict):
     for it in msg.get("content", []):
         sym = it.get("key")
@@ -499,6 +545,7 @@ def on_timesale(msg: dict):
                 _summarize(sym, now)
 
 def on_book(msg: dict):
+    global _last_msg_ts
     now = time()
     for it in msg.get("content", []):
         sym = it.get("key")
@@ -602,14 +649,25 @@ def on_book(msg: dict):
                 alert_history[sym].append(alert)
                 if len(alert_history[sym]) > 10:
                     alert_history[sym].pop(0)
-                c = conn.cursor()
-                c.execute(
-                    "INSERT INTO alerts (timestamp, symbol, ratio, total_bids, total_asks, heavy_venues, direction, price) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (alert["timestamp"], alert["symbol"], alert["ratio"], alert["total_bids"],
-                     alert["total_asks"], alert["heavy_venues"], alert["direction"], alert["price"])
-                )
-                conn.commit()
+                global inline_only_next_alert_id
+                if inline_only_mode:
+                    inline_only_next_alert_id += 1
+                    next_alert_id = inline_only_next_alert_id
+                else:
+                    c = conn.cursor()
+                    c.execute("SELECT IFNULL(MAX(rowid), 0) FROM alerts")
+                    next_alert_id = (c.fetchone() or [0])[0] + 1
+                inline_ok = True
+                if inline_trader_dispatch:
+                    inline_ok = inline_trader_dispatch(next_alert_id, alert)
+                if not inline_only_mode or not inline_ok:
+                    c.execute(
+                        "INSERT INTO alerts (rowid, timestamp, symbol, ratio, total_bids, total_asks, heavy_venues, direction, price) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (next_alert_id, alert["timestamp"], alert["symbol"], alert["ratio"], alert["total_bids"],
+                         alert["total_asks"], alert["heavy_venues"], alert["direction"], alert["price"])
+                    )
+                    conn.commit()
                 last_alert[sym] = now
                 log_structured("ALERT", {
                     "symbol": sym,
@@ -627,7 +685,15 @@ async def resolve_exchange(client: Client, sym: str) -> Optional[str]:
     if sym in exchange_cache:
         return exchange_cache[sym]
     try:
-        instruments = await client.get_instruments([sym], projection="fundamental")
+        get_instruments = getattr(client, "get_instruments", None)
+        if get_instruments is None:
+            raise RuntimeError("Client missing get_instruments")
+
+        instruments = get_instruments([sym], projection="fundamental")
+        if asyncio.iscoroutine(instruments):
+            instruments = await instruments
+        if hasattr(instruments, "json"):
+            instruments = instruments.json()
         for inst in instruments:
             if inst.get("symbol") == sym:
                 exchange = inst.get("primary_exchange")
@@ -668,6 +734,9 @@ async def _heartbeat_task():
 
 # Main function
 async def main():
+    # CLI setup: these flags let you tune alert sensitivity without editing
+    # code. Defaults come from environment variables so scripts and terminals
+    # behave the same way.
     parser = argparse.ArgumentParser(description="Stream L2 data for penny basing detection.")
     parser.add_argument("--symbols", type=str, help="Comma or space separated symbols (overrides $SYMBOLS).")
     parser.add_argument("--window", type=int, help="Rolling window seconds (overrides $WINDOW_SECONDS).")
@@ -732,6 +801,8 @@ async def main():
     MIN_VOLUME = args.min_volume if args.min_volume is not None else _get_int_env("MIN_VOLUME", 100000, 1000)
     MIN_IMBALANCE_DURATION_SEC = args.min_imbalance_duration if args.min_imbalance_duration is not None else _get_float_env("MIN_IMBALANCE_DURATION_SEC", 10.0, 0.0)
     DB_PATH = args.db_path if args.db_path is not None else os.getenv("DB_PATH", "penny_basing.db")
+    os.environ["DB_PATH"] = str(DB_PATH)
+    inline_only_requested = _bool_env("INLINE_DISPATCH_ONLY", False)
     # if args.symbols:
     #     SYMBOLS = [s.strip().upper() for s in args.symbols.replace(" ", ",").split(",") if s.strip()]
     # else:
@@ -753,7 +824,7 @@ async def main():
     msg_count = {s: 0 for s in SYMBOLS}
 
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    global conn
+    global conn, inline_only_next_alert_id
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("PRAGMA table_info(alerts)")
@@ -773,7 +844,76 @@ async def main():
                 price REAL
             )
         ''')
+    inline_only_next_alert_id = (c.execute("SELECT IFNULL(MAX(rowid), 0) FROM alerts").fetchone() or [0])[0]
     conn.commit()
+
+    global inline_trader_dispatch, inline_only_mode
+    inline_trader_dispatch = None
+    inline_only_mode = False
+    try:
+        from live_trader import LiveTrader
+
+        inline_trader = LiveTrader(dry_run=_bool_env("INLINE_LIVE_DRY_RUN", False))
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue(maxsize=_get_int_env("INLINE_TRADER_QUEUE", 100, 10))
+        worker_count = _get_int_env("INLINE_TRADER_WORKERS", 1, 1)
+        inline_queue_drops = 0
+
+        async def _inline_worker() -> None:
+            while True:
+                alert_id, alert, enqueued_at = await queue.get()
+                try:
+                    lag = time() - enqueued_at
+                    if lag > 0.5:
+                        log_structured("INLINE_TRADER_LAG", {"alert_id": alert_id, "lag_sec": round(lag, 3)})
+                    await loop.run_in_executor(
+                        None,
+                        inline_trader.process_alert,
+                        int(alert_id),
+                        alert["symbol"],
+                        alert["direction"],
+                        float(alert["price"]),
+                    )
+                except Exception as exc:
+                    log_structured("INLINE_TRADER_ERROR", {"error": str(exc), "alert_id": alert_id})
+                finally:
+                    queue.task_done()
+
+        for _ in range(worker_count):
+            asyncio.create_task(_inline_worker())
+
+        def inline_trader_dispatch(alert_id: int, alert: dict) -> bool:
+            nonlocal inline_queue_drops
+            try:
+                queue.put_nowait((alert_id, alert, time()))
+                return True
+            except asyncio.QueueFull:
+                inline_queue_drops += 1
+                log_structured(
+                    "INLINE_TRADER_WARNING",
+                    {
+                        "status": "queue_full",
+                        "alert_id": alert_id,
+                        "symbol": alert.get("symbol"),
+                        "drops": inline_queue_drops,
+                    },
+                )
+                return False
+
+        inline_only_mode = inline_only_requested
+        inline_log = {"status": "enabled", "dry_run": inline_trader.dry_run}
+        if inline_only_mode:
+            inline_log["mode"] = "inline_only"
+        log_structured("INLINE_TRADER", inline_log)
+    except Exception as exc:
+        inline_only_mode = False
+        log_structured("INLINE_TRADER_ERROR", {"error": str(exc)})
+
+    if inline_only_requested and not inline_only_mode:
+        log_structured(
+            "INLINE_TRADER",
+            {"status": "inline_only_disabled", "reason": "dispatch unavailable"},
+        )
 
     try:
         client = easy_client(api_key=api_key, app_secret=app_secret,
