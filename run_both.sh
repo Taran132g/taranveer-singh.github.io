@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # run_both.sh – FULL SYSTEM:
-# sup_res → grok → paper_trader → live_trader → UI
+# grok → paper_trader → live_trader → UI
 
 set -eo pipefail
 IFS=$'\n\t'
 
-PYTHON_BIN="python3"
+if [[ -d ".venv" ]]; then
+    PYTHON_BIN=".venv/bin/python"
+else
+    PYTHON_BIN="python3"
+fi
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 GROK_LOG="$BASE_DIR/grok.log"
@@ -33,7 +37,6 @@ trap 'cleanup' INT TERM EXIT
 echo "[RESET] Clearing previous data..."
 rm -f "$BASE_DIR"/*.log
 rm -f "$BASE_DIR/penny_basing.db"
-rm -f "$ALERTS_FILE"
 rm -f "$BASE_DIR/paper_trader_state.json"
 rm -f "$BASE_DIR/live_trader_state.json"
 rm -f "$BASE_DIR/daily_pnl.txt"
@@ -76,7 +79,6 @@ $PYTHON_BIN -m streamlit run ui.py \
     > "$UI_LOG" 2>&1 &
 UI_PID=$!
 echo " • UI running → http://localhost:8501"
-
 
 
 echo -e "\nALL SERVICES RUNNING:"
