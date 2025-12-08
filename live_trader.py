@@ -205,8 +205,10 @@ class SchwabOrderExecutor:
         if isinstance(payload, dict):
             status = payload.get("status") or payload.get("orderStatus") or payload.get("order_status")
             filled_qty = payload.get("filledQuantity") or payload.get("filled_quantity")
+            avg_fill_price = payload.get("averageExecutionPrice") or payload.get("avg_execution_price")
             result["status"] = status
             result["filled_quantity"] = filled_qty
+            result["avg_fill_price"] = avg_fill_price
             result["raw"] = payload
         else:
             result["raw"] = str(payload)
@@ -498,6 +500,27 @@ class LiveTrader:
     # ------------------------------------------------------------------
     # Order + alert processing
     # ------------------------------------------------------------------
+    def _check_fill_quality(self, side: str, price: float) -> None:
+        """Check for 'bad fills' (longs at .99, shorts at .01) and kill switch if found."""
+        if price is None or price <= 0:
+            return
+
+        cents = price % 1.0
+        # Floating point math safety
+        is_99 = 0.985 <= cents <= 0.995
+        is_01 = 0.005 <= cents <= 0.015
+
+        bad_fill = False
+        if side in {"BUY", "COVER"} and is_99:
+            bad_fill = True
+        elif side in {"SELL", "SHORT"} and is_01:
+            bad_fill = True
+
+        if bad_fill:
+            msg = f"Bad fill detected: {side} at {price:.2f}"
+            LOGGER.error(msg)
+            self._engage_emergency_shutdown(msg)
+
     def _record_order(self, *, alert_id: int, symbol: str, direction: str, side: str, qty: int, price: float, result: dict) -> None:
         serialized = json.dumps(result, default=str)
         with self._open_conn() as conn:
@@ -538,6 +561,7 @@ class LiveTrader:
         filled = False
         filled_qty = 0
         fill_status: Optional[str] = None
+        actual_price = price
 
         if submitted:
             self._record_fill(symbol=symbol, side=side, qty=qty)
@@ -545,6 +569,17 @@ class LiveTrader:
             filled_qty = qty
             fill_status = "FILLED"
             result["filled_via"] = "MARKET"
+
+            # Fetch actual fill price for bad fill detection
+            order_id = result.get("order_id")
+            if order_id and not result.get("dry_run"):
+                # Give Schwab a moment to process the fill
+                time.sleep(0.5)
+                status = self.executor.fetch_order_status(order_id)
+                avg_price = status.get("avg_fill_price")
+                if avg_price:
+                    actual_price = float(avg_price)
+                    self._check_fill_quality(side, actual_price)
         else:
             fill_status = "FAILED"
 
@@ -560,7 +595,7 @@ class LiveTrader:
             direction=direction,
             side=side,
             qty=qty,
-            price=price,
+            price=actual_price,
             result=result,
         )
         return filled
@@ -617,6 +652,7 @@ class LiveTrader:
         while order_id and self.limit_fill_timeout > 0:
             status = self.executor.fetch_order_status(order_id)
             filled_qty = status.get("filled_quantity") if isinstance(status, dict) else None
+            avg_price = status.get("avg_fill_price") if isinstance(status, dict) else None
             status_value = (status.get("status") or "").upper() if isinstance(status, dict) else ""
 
             if filled_qty is None and status_value == "FILLED":
@@ -632,6 +668,9 @@ class LiveTrader:
                 )
                 if filled_qty_seen >= qty:
                     filled = True
+                    if avg_price:
+                        self._check_fill_quality(side, float(avg_price))
+                        reference_price = float(avg_price)
                     break
 
             if time.time() - start >= self.limit_fill_timeout:

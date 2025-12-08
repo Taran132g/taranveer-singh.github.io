@@ -63,7 +63,43 @@ EXCHANGE_MAP = {
     "AMEX": "NYSE_AMEX",
     "CINN": "CINCINNATI",
     "BOSX": "BOX",
-    "PHLX": "NASDAQ_PHLX"
+    "PHLX": "NASDAQ_PHLX",
+    # SIP Codes
+    "A": "NYSE_AMEX",
+    "B": "NASDAQ_BX",
+    "C": "CINCINNATI",  # NYSE National
+    "H": "MIAX",
+    "I": "ISE",
+    "J": "CBOE_EDGA",
+    "K": "CBOE_EDGX",
+    "M": "MIAX_SAPPHIRE", # NYSE Chicago usually, but mapping to existing MWSE/MIAX_SAPPHIRE logic if appropriate, or just CHICAGO
+    "N": "NYSE",
+    "P": "NYSE_ARCA",
+    "Q": "NASDAQ",
+    "U": "MEMX",
+    "V": "IEX",
+    "X": "NASDAQ_PHLX", # NASDAQ PSX usually, but PHLX is close
+    "Y": "CBOE_BYX",
+    "Z": "CBOE_BZX",
+    "ETMM": "OFF_EXCHANGE", # Likely internal/OTC
+    "G": "UNKNOWN_G", # Often TRF or similar
+    # Market Makers (BBAI and others)
+    "GSCO": "GSCO",
+    "XGWD": "XGWD",
+    "BTBS": "BTBS",
+    "SGAS": "SGAS",
+    "WBPX": "WBPX",
+    "SSUS": "SSUS",
+    "IMCC": "IMCC",
+    "FLTG": "FLTG",
+    "VIRT": "VIRT",
+    "CDRG": "CDRG",
+    "TSSM": "TSSM",
+    "MLCO": "MLCO",
+    "NORT": "NORT",
+    "AEXG": "AEXG",
+    "LEHM": "LEHM",
+    "MAXM": "MAXM",
 }
 
 # Helpers
@@ -424,36 +460,43 @@ def on_level1(msg: dict):
             if DEBUG and _l1_debug_remaining[sym] > 0:
                 _l1_debug_remaining[sym] -= 1
                 log_structured("L1_DEBUG", {"symbol": sym, "payload": it})
+
+            # Merge update into state
+            if sym not in last_l1:
+                last_l1[sym] = {}
+            last_l1[sym].update(it)
+            
+            # Use merged state for price lookup
+            merged = last_l1[sym]
             price = None
             missing_fields = []
-            if "LAST_PRICE" not in it:
-                missing_fields.append("LAST_PRICE")
-            else:
-                price = it.get("LAST_PRICE")
-            if not price and "BID_PRICE" not in it:
-                missing_fields.append("BID_PRICE")
-            else:
-                price = price or it.get("BID_PRICE")
-            if not price and "ASK_PRICE" not in it:
-                missing_fields.append("ASK_PRICE")
-            else:
-                price = price or it.get("ASK_PRICE")
-            if not price and "CLOSE_PRICE" not in it:
-                missing_fields.append("CLOSE_PRICE")
-            else:
-                price = price or it.get("CLOSE_PRICE")
-            if not price and sym in last_l1:
-                price = last_l1[sym].get("LAST_PRICE")
+            
+            if "LAST_PRICE" in merged:
+                price = merged["LAST_PRICE"]
+            elif "BID_PRICE" in merged:
+                price = merged["BID_PRICE"]
+            elif "ASK_PRICE" in merged:
+                price = merged["ASK_PRICE"]
+            elif "CLOSE_PRICE" in merged:
+                price = merged["CLOSE_PRICE"]
+            
             if not price:
+                # Check what's missing from the MERGED state
+                if "LAST_PRICE" not in merged: missing_fields.append("LAST_PRICE")
+                if "BID_PRICE" not in merged: missing_fields.append("BID_PRICE")
+                if "ASK_PRICE" not in merged: missing_fields.append("ASK_PRICE")
+                if "CLOSE_PRICE" not in merged: missing_fields.append("CLOSE_PRICE")
+                
                 log_structured("L1_WARNING", {
                     "symbol": sym,
                     "message": "No valid price",
                     "missing_fields": missing_fields
                 })
                 continue
+            
             try:
                 price = float(price)
-                last_l1[sym] = it
+                # last_l1 is already updated
             except (TypeError, ValueError):
                 log_structured("L1_WARNING", {"symbol": sym, "message": "Invalid price", "value": price})
                 continue
@@ -931,8 +974,9 @@ async def main():
         )
 
     try:
-        client = easy_client(api_key=api_key, app_secret=app_secret,
-                            callback_url=redirect_uri, token_path=token_path)
+        log_structured("CLIENT_INIT", {"token_path": token_path})
+        from schwab import auth
+        client = auth.client_from_token_file(token_path=token_path, api_key=api_key, app_secret=app_secret, enforce_enums=False)
     except Exception as e:
         log_structured("CLIENT_ERROR", {"error": f"Failed to initialize Schwab client: {e}"})
         sys.exit(3)
@@ -982,32 +1026,40 @@ async def main():
     else:
         await stream.chart_equity_subs(SYMBOLS)
 
+    nasdaq_syms = []
+    nyse_syms = []
+
     for sym in SYMBOLS:
         if sym == "CRON":
             log_structured("SUBS", {"symbol": sym, "exchange": "NASDAQ"})
-            await stream.nasdaq_book_subs([sym])
+            nasdaq_syms.append(sym)
             continue
-        if sym == "F":
-            log_structured("SUBS", {"symbol": sym, "exchange": "NYSE"})
-            await stream.nyse_book_subs([sym])
-            continue
+        # if sym == "F":  <-- REMOVED to fix F alerts
+        #     log_structured("SUBS", {"symbol": sym, "exchange": "NYSE"})
+        #     await stream.nyse_book_subs([sym])
+        #     continue
         ex = await resolve_exchange(client, sym)
         if ex is None:
             if sym not in PRINTED_NO_INSTR:
                 log_structured("SUBS_WARNING", {"symbol": sym, "message": "No instrument found, subscribing to both books"})
                 PRINTED_NO_INSTR.add(sym)
-            await stream.nasdaq_book_subs([sym])
-            await stream.nyse_book_subs([sym])
+            nasdaq_syms.append(sym)
+            nyse_syms.append(sym)
         elif ex == "NASDAQ":
-            await stream.nasdaq_book_subs([sym])
+            nasdaq_syms.append(sym)
         elif ex == "NYSE":
-            await stream.nyse_book_subs([sym])
+            nyse_syms.append(sym)
         else:
             if sym not in PRINTED_NO_INSTR:
                 log_structured("SUBS_WARNING", {"symbol": sym, "exchange": ex, "message": "Unsupported exchange, subscribing to both"})
                 PRINTED_NO_INSTR.add(sym)
-            await stream.nasdaq_book_subs([sym])
-            await stream.nyse_book_subs([sym])
+            nasdaq_syms.append(sym)
+            nyse_syms.append(sym)
+
+    if nasdaq_syms:
+        await stream.nasdaq_book_subs(nasdaq_syms)
+    if nyse_syms:
+        await stream.nyse_book_subs(nyse_syms)
 
     log_structured("SUBS", {"message": f"Subscribed to L1, {'timesales' if has_ts else 'chart'}, and L2 for: {', '.join(SYMBOLS)}"})
     log_structured("START", {

@@ -1,269 +1,300 @@
-import json
 import os
 import sqlite3
+import time
 from contextlib import closing
 from pathlib import Path
 import pandas as pd
 import streamlit as st
-import time as time_module
+from datetime import datetime
 
-REFRESH_INTERVAL_SECONDS = 5
+# Configuration
+REFRESH_INTERVAL = 3
 DB_PATH = Path("penny_basing.db").resolve()
-LIVE_STATE_PATH = Path(os.getenv("LIVE_STATE_FILE", "live_trader_state.json")).resolve()
+PAGE_TITLE = "Penny Basing | Paper Trader"
 
-def init_db():
-    try:
-        with closing(sqlite3.connect(str(DB_PATH))) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='alerts'")
-            if not cursor.fetchone():
-                cursor.execute('''
-                    CREATE TABLE alerts (
-                        timestamp REAL,
-                        symbol TEXT,
-                        ratio REAL,
-                        total_bids INTEGER,
-                        total_asks INTEGER,
-                        heavy_venues INTEGER,
-                        direction TEXT,
-                        price REAL
-                    )
-                ''')
-                conn.commit()
-    except Exception as e:
-        st.error(f"DB init failed: {e}")
+st.set_page_config(page_title=PAGE_TITLE, layout="wide", page_icon="📈")
 
-init_db()
-
-st.set_page_config(page_title="Penny Basing", layout="wide")
-
-# ===================== STYLING =====================
-
-st.markdown(
-    """
+# --- CSS Styling ---
+st.markdown("""
     <style>
-    body { background-color: #0f172a; color: #f8fafc; }
-    .panel {
-        padding: 1rem 1.5rem 1.5rem;
-        border-radius: 1.25rem;
-        box-shadow: 0 25px 50px -12px rgba(15, 23, 42, 0.45);
-    }
-    .panel h3 { margin-top: 0; }
-    .alert-panel { background: linear-gradient(160deg, rgba(30, 64, 175, 0.85), rgba(30, 64, 175, 0.55)); }
-    .log-panel { background: linear-gradient(160deg, rgba(15, 23, 42, 0.85), rgba(15, 23, 42, 0.55)); }
-    .stDataFrame [data-testid="stDataFrame"] { background-color: rgba(15, 23, 42, 0.25); border-radius: 0.85rem; }
+        .block-container { padding-top: 1rem; padding-bottom: 1rem; }
+        .stMetric {
+            background-color: #1e293b;
+            padding: 10px;
+            border-radius: 8px;
+            border: 1px solid #334155;
+        }
+        [data-testid="stDataFrame"] {
+            border: 1px solid #334155;
+            border-radius: 8px;
+        }
     </style>
-    """,
-    unsafe_allow_html=True,
-)
+""", unsafe_allow_html=True)
 
-# ===================== DATA LOADERS =====================
+# --- Data Loading Functions ---
 
-def load_alerts() -> pd.DataFrame:
-    try:
-        with closing(sqlite3.connect(str(DB_PATH))) as conn:
-            df = pd.read_sql_query("SELECT * FROM alerts ORDER BY timestamp DESC", conn)
-    except Exception as exc:
-        st.warning(f"DB error: {exc}")
-        return pd.DataFrame()
-    if df.empty:
-        return df
+def get_db_connection():
+    return sqlite3.connect(str(DB_PATH))
 
-    df["timestamp"] = (
-        pd.to_datetime(df["timestamp"], unit="s", utc=True, errors="coerce")
-          .dt.tz_convert("US/Eastern")
-    )
+def load_data():
+    """Load all necessary data in one go to ensure consistency."""
+    data = {}
+    
+    with closing(get_db_connection()) as conn:
+        # 1. Alerts
+        try:
+            data['alerts'] = pd.read_sql_query(
+                "SELECT * FROM alerts ORDER BY timestamp DESC LIMIT 50", conn
+            )
+            if not data['alerts'].empty:
+                data['alerts']["timestamp"] = pd.to_datetime(
+                    data['alerts']["timestamp"], unit="s", utc=True
+                ).dt.tz_convert("US/Eastern")
+        except Exception:
+            data['alerts'] = pd.DataFrame()
 
-    return df
+        # 2. Paper Positions
+        try:
+            data['positions'] = pd.read_sql_query("SELECT * FROM paper_positions", conn)
+        except Exception:
+            data['positions'] = pd.DataFrame()
 
+        # 3. Realized PnL (Summary)
+        try:
+            data['realized'] = pd.read_sql_query(
+                "SELECT symbol, SUM(pnl) as realized_pnl FROM paper_trades GROUP BY symbol", conn
+            )
+        except Exception:
+            data['realized'] = pd.DataFrame()
 
-def load_paper_positions() -> pd.DataFrame:
-    try:
-        with closing(sqlite3.connect(str(DB_PATH))) as conn:
-            df = pd.read_sql_query("SELECT * FROM paper_positions", conn)
-    except Exception:
-        return pd.DataFrame()
-    return df
+        # 4. Trade History (for Graph)
+        try:
+            data['trades'] = pd.read_sql_query(
+                "SELECT timestamp, pnl, side FROM paper_trades ORDER BY timestamp ASC", conn
+            )
+            if not data['trades'].empty:
+                data['trades']["timestamp"] = pd.to_datetime(
+                    data['trades']["timestamp"], unit="s", utc=True
+                ).dt.tz_convert("US/Eastern")
+        except Exception:
+            data['trades'] = pd.DataFrame()
 
+    return data
 
-def _latest_prices(symbols: list[str]) -> dict[str, float]:
-    if not symbols:
-        return {}
-    try:
-        with closing(sqlite3.connect(str(DB_PATH))) as conn:
-            placeholders = ",".join(["?"] * len(symbols))
-            query = f"""
-                SELECT symbol, price
-                FROM (
-                    SELECT symbol, price, ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY timestamp DESC) AS rn
-                    FROM alerts
-                    WHERE symbol IN ({placeholders})
-                )
-                WHERE rn = 1
-            """
-            df = pd.read_sql_query(query, conn, params=symbols)
-    except Exception as exc:
-        st.warning(f"Price lookup failed: {exc}")
-        return {}
-    return dict(zip(df["symbol"], df["price"]))
+# --- Main UI Layout ---
 
+# st.title(f"🚀 {PAGE_TITLE}") # Moved down
 
-def load_live_positions() -> pd.DataFrame:
-    if not LIVE_STATE_PATH.exists():
-        return pd.DataFrame()
-    try:
-        data = json.loads(LIVE_STATE_PATH.read_text())
-    except Exception as exc:
-        st.warning(f"Failed to read live state: {exc}")
-        return pd.DataFrame()
+# Load Data
+data = load_data()
 
-    positions = data.get("positions", {}) or {}
-    if not positions:
-        return pd.DataFrame()
+# Calculate Data
+configured_symbols = [s.strip() for s in os.getenv("SYMBOLS", "").split(",") if s.strip()]
+all_symbols = set(configured_symbols)
+if not data['positions'].empty:
+    all_symbols.update(data['positions']['symbol'].unique())
+if not data['realized'].empty:
+    all_symbols.update(data['realized']['symbol'].unique())
 
-    df = pd.DataFrame(
-        {
-            "symbol": list(positions.keys()),
-            "qty": [int(v) for v in positions.values()],
+summary_rows = []
+total_unrealized = 0.0
+total_realized = 0.0
+
+for sym in sorted(all_symbols):
+    # Get Position Data
+    pos = data['positions'][data['positions']['symbol'] == sym]
+    qty = pos.iloc[0]['qty'] if not pos.empty else 0
+    unrealized = pos.iloc[0]['pnl'] if not pos.empty else 0.0
+    entry_price = pos.iloc[0]['entry_price'] if not pos.empty and 'entry_price' in pos.columns else 0.0
+    
+    # Get Realized Data
+    real = data['realized'][data['realized']['symbol'] == sym]
+    realized_val = real.iloc[0]['realized_pnl'] if not real.empty else 0.0
+    
+    total_unrealized += unrealized
+    total_realized += realized_val
+    
+    summary_rows.append({
+        "Symbol": sym,
+        "Qty": qty,
+        "Entry Price": entry_price,
+        "Unrealized PnL": unrealized,
+        "Realized PnL": realized_val,
+        "Total PnL": unrealized + realized_val
+    })
+
+total_pnl = total_unrealized + total_realized
+
+# --- Main UI Layout (Header) ---
+h_col1, h_col2 = st.columns([3, 1])
+with h_col1:
+    current_date = datetime.now().strftime("%b %-d, %Y")
+    st.title(f"🚀 {PAGE_TITLE} - {current_date}")
+with h_col2:
+    st.markdown(f"<div style='text-align: right; font-size: 1.5em; font-weight: bold; padding-top: 35px;'>Portfolio PnL: <span style='color: {'#00FF99' if total_realized >= 0 else '#FF3366'}'>${total_realized:,.2f}</span></div>", unsafe_allow_html=True)
+
+# Top Metrics (Compact)
+# st.markdown(f"### 💰 Total Portfolio: **${total_pnl:,.2f}** <span style='font-size:0.8em; color:#94a3b8'>(Realized: **${total_realized:,.2f}** | Unrealized: **${total_unrealized:,.2f}**)</span>", unsafe_allow_html=True)
+st.divider()
+
+# ROW 1: Unified Positions & PnL
+st.subheader("📊 Portfolio Overview")
+
+if summary_rows:
+    df_summary = pd.DataFrame(summary_rows)
+    
+    # Calculate Totals (Removed as per user request)
+    # total_row = pd.DataFrame([{ ... }])
+    
+    # Prepend Total Row (Removed)
+    df_display = df_summary.copy()
+    
+    # Format for display (Removed manual string conversion to allow Styler to work)
+    # def format_currency(x): ...
+    
+    # Remove Total PnL column if it exists
+    if "Total PnL" in df_display.columns:
+        df_display = df_display.drop(columns=["Total PnL"])
+
+    # Styling with Pandas Styler
+    def style_dataframe(styler):
+        styler.format({
+            "Qty": "{:.0f}",
+            "Entry Price": "${:,.2f}",
+            "Unrealized PnL": "${:,.2f}",
+            "Realized PnL": "${:,.2f}",
+        }, na_rep="")
+        
+        # Bold specific columns
+        styler.set_properties(subset=["Symbol", "Realized PnL"], **{'font-weight': 'bold'})
+        
+        # Color code PnL columns
+        def color_pnl(val):
+            if isinstance(val, (int, float)):
+                if val > 0:
+                    return 'color: #00FF99'
+                elif val < 0:
+                    return 'color: #FF3366'
+            return 'color: white'
+
+        styler.map(color_pnl, subset=["Unrealized PnL", "Realized PnL"])
+
+        return styler
+
+    st.dataframe(
+        style_dataframe(df_display.style), 
+        use_container_width=True, 
+        hide_index=True,
+        column_config={
+            "Symbol": st.column_config.TextColumn("Symbol", width="small"),
+            "Qty": st.column_config.NumberColumn("Qty", format="%d"),
         }
     )
-    prices = _latest_prices(df["symbol"].tolist())
-    if prices:
-        df["current_price"] = df["symbol"].map(prices)
-    return df
+else:
+    st.info("No data.")
 
+st.divider()
 
-# NEW — Load daily PnL written by paper_trader.py
-def load_daily_pnl():
-    try:
-        with open("daily_pnl.txt", "r") as f:
-            return float(f.read().strip())
-    except:
-        return 0.0
+# ROW 2
+r2_c1, r2_c2 = st.columns(2)
 
-# ===================== LOGBOOK (SESSION) =====================
+with r2_c1:
+    # PnL Graph
+    if not data['trades'].empty:
+        import plotly.graph_objects as go
+        
+        st.subheader("📈 Cumulative PnL")
+        df_chart = data['trades'].copy()
+        df_chart['cumulative_pnl'] = df_chart['pnl'].cumsum()
+        
+        fig = go.Figure()
+        
+        # Main PnL Line
+        fig.add_trace(go.Scatter(
+            x=df_chart['timestamp'],
+            y=df_chart['cumulative_pnl'],
+            mode='lines',
+            name='PnL',
+            line=dict(color='#00FF99', width=3),
+            fill='tozeroy',
+            fillcolor='rgba(0, 255, 153, 0.1)'
+        ))
+        
+        # Buy Markers
+        buys = df_chart[df_chart['side'] == 'long']
+        if not buys.empty:
+            fig.add_trace(go.Scatter(
+                x=buys['timestamp'],
+                y=buys['cumulative_pnl'],
+                mode='markers+text',
+                name='Buy',
+                marker=dict(symbol='triangle-up', color='#00FF99', size=12, line=dict(color='white', width=1)),
+                text=["BUY"] * len(buys),
+                textposition="top center",
+                textfont=dict(color='#00FF99', size=10)
+            ))
+            
+        # Sell Markers
+        sells = df_chart[df_chart['side'] == 'short']
+        if not sells.empty:
+            fig.add_trace(go.Scatter(
+                x=sells['timestamp'],
+                y=sells['cumulative_pnl'],
+                mode='markers+text',
+                name='Sell',
+                marker=dict(symbol='triangle-down', color='#FF3366', size=12, line=dict(color='white', width=1)),
+                text=["SELL"] * len(sells),
+                textposition="bottom center",
+                textfont=dict(color='#FF3366', size=10)
+            ))
 
-if "logbook" not in st.session_state:
-    st.session_state["logbook"] = pd.DataFrame()
-
-alerts_df = load_alerts()
-st.session_state["logbook"] = pd.concat([alerts_df, st.session_state["logbook"]], ignore_index=True)
-st.session_state["logbook"] = (
-    st.session_state["logbook"]
-    .drop_duplicates(subset=["timestamp", "symbol"])
-    .sort_values("timestamp", ascending=False)
-    .reset_index(drop=True)
-)
-
-# ===================== LATEST ALERTS HEADER =====================
-
-st.markdown("### Latest Alerts")
-
-if not alerts_df.empty:
-    latest = alerts_df.drop_duplicates(subset=["symbol"], keep="first")
-    cols = st.columns(min(len(latest), 5))
-
-    for idx, (_, row) in enumerate(latest.iterrows()):
-        with cols[idx % 5]:
-            direction_text = row["direction"].lower()
-
-            if "bid" in direction_text:
-                # bid-heavy → UP arrow (green)
-                label = f"BUY {row['symbol']}"
-                delta = "bid-heavy"
-                delta_color = "normal"     # UP arrow
-            else:
-                # ask-heavy → DOWN arrow (red)
-                label = f"SELL {row['symbol']}"
-                delta = "ask-heavy"
-                delta_color = "inverse"    # DOWN arrow
-
-            st.metric(
-                label=label,
-                value=f"${row['price']:.3f}",
-                delta=delta,
-                delta_color=delta_color,
-            )
-
-    st.divider()
-
-# ===================== LAYOUT COLUMNS =====================
-
-positions_col, logbook_col = st.columns([1, 1.2], gap="large")
-
-# ===================== OPEN POSITIONS PANEL =====================
-
-with positions_col:
-    st.markdown("### Open Positions")
-
-    position_source = st.radio(
-        "Position source",
-        ("Paper trader", "Live trader"),
-        horizontal=True,
-    )
-
-    if position_source == "Paper trader":
-        positions_df = load_paper_positions()
-    else:
-        positions_df = load_live_positions()
-
-    if positions_df.empty:
-        st.info("No positions.")
-    else:
-        display = positions_df.copy()
-
-        if {"entry_price", "current_price", "pnl", "pnl_percent"}.issubset(display.columns):
-            display["entry_price"] = display["entry_price"].apply(lambda x: f"${x:.3f}")
-            display["current_price"] = display["current_price"].apply(lambda x: f"${x:.3f}")
-            display["pnl"] = display["pnl"].apply(lambda x: f"${x:+.2f}")
-            display["pnl_percent"] = display["pnl_percent"].apply(lambda x: f"{x:+.1f}%")
-            visible_cols = ["symbol", "qty", "entry_price", "current_price", "pnl", "pnl_percent"]
-        else:
-            if "current_price" in display.columns:
-                display["current_price"] = display["current_price"].apply(lambda x: f"${x:.3f}")
-                visible_cols = ["symbol", "qty", "current_price"]
-            else:
-                visible_cols = ["symbol", "qty"]
-
-        st.dataframe(
-            display[visible_cols],
-            use_container_width=True,
-            hide_index=True
+        fig.update_layout(
+            template="plotly_dark",
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            margin=dict(l=10, r=10, t=30, b=10),
+            height=350,
+            xaxis=dict(
+                showgrid=True, 
+                gridcolor='rgba(255,255,255,0.1)',
+                tickformat='%H:%M:%S',  # Show only time on axis
+                hoverformat='%H:%M:%S'  # Show only time on hover
+            ),
+            yaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.1)', tickprefix="$"),
+            hovermode="x unified",
+            showlegend=False
         )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No trades yet.")
 
-        if position_source == "Paper trader" and "pnl" in positions_df.columns:
-            total_pnl = positions_df["pnl"].sum()
-            daily_pnl = load_daily_pnl()
+with r2_c2:
+    st.subheader("🔔 Recent Alerts")
+    if not data['alerts'].empty:
+        # Create tabs for each symbol + All
+        sorted_syms = sorted(list(all_symbols))
+        tabs = st.tabs(["All"] + sorted_syms)
+        
+        # "All" Tab
+        with tabs[0]:
+            alerts_display = data['alerts'][["timestamp", "symbol", "direction", "price"]].copy()
+            alerts_display["timestamp"] = alerts_display["timestamp"].dt.strftime("%H:%M:%S")
+            alerts_display["price"] = alerts_display["price"].apply(lambda x: f"${x:.3f}")
+            st.dataframe(alerts_display, use_container_width=True, hide_index=True, height=300)
+            
+        # Per-Symbol Tabs
+        for i, sym in enumerate(sorted_syms):
+            with tabs[i+1]:
+                sym_alerts = data['alerts'][data['alerts']['symbol'] == sym].copy()
+                if not sym_alerts.empty:
+                    sym_alerts["timestamp"] = sym_alerts["timestamp"].dt.strftime("%H:%M:%S")
+                    sym_alerts["price"] = sym_alerts["price"].apply(lambda x: f"${x:.3f}")
+                    st.dataframe(sym_alerts[["timestamp", "direction", "price"]], use_container_width=True, hide_index=True, height=300)
+                else:
+                    st.info(f"No alerts for {sym}.")
+    else:
+        st.info("No alerts yet.")
 
-            metric_cols = st.columns(2)
-            with metric_cols[0]:
-                st.metric("Open Position P&L (Unrealized)", f"${total_pnl:+.2f}")
-            with metric_cols[1]:
-                st.metric("Daily PnL (Realized)", f"${daily_pnl:+.2f}")
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-# ===================== ALERT LOG PANEL =====================
-
-with logbook_col:
-    st.markdown("### Alert Log")
-
-    logbook_df = st.session_state["logbook"]
-
-    if not logbook_df.empty:
-        show = logbook_df[["timestamp", "symbol", "direction", "price"]].copy()
-        show["price"] = show["price"].apply(lambda x: f"${x:.3f}")
-        show["timestamp"] = show["timestamp"].dt.strftime("%I:%M %p")
-
-        st.dataframe(show, use_container_width=True, hide_index=True, height=500)
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-# ===================== REFRESH =====================
-
-if st.button("Refresh"):
-    st.rerun()
-
-st.info(f"Auto-refresh in {REFRESH_INTERVAL_SECONDS}s")
-time_module.sleep(REFRESH_INTERVAL_SECONDS)
+# --- Auto Refresh ---
+time.sleep(REFRESH_INTERVAL)
 st.rerun()

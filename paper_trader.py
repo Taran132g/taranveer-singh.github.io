@@ -46,7 +46,8 @@ class PaperTrader:
                 with open(STATE_FILE, "r") as f:
                     data = json.load(f)
                     self.cash = float(data.get("cash", 100_000.0))
-                    self.positions = data.get("positions", {})
+                    # self.positions = data.get("positions", {})  <-- REMOVED
+                    self.positions = {} # Always start empty
                 print(f"[PAPER] Loaded state: Cash ${self.cash:,.2f}, {len(self.positions)} positions", flush=True)
             except:
                 self.cash = 100_000.0
@@ -56,7 +57,8 @@ class PaperTrader:
             self.positions = {}
 
     def save_state(self):
-        state = {"cash": self.cash, "positions": self.positions}
+        # Only save cash, not positions
+        state = {"cash": self.cash} #, "positions": self.positions} 
         try:
             with open(STATE_FILE, "w") as f:
                 json.dump(state, f, indent=2)
@@ -102,6 +104,10 @@ class PaperTrader:
                     pnl_percent REAL
                 )
             """)
+            
+            # Explicitly clear positions on startup
+            cur.execute("DELETE FROM paper_positions")
+            conn.commit()
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS paper_seen_prices (
@@ -362,13 +368,18 @@ class PaperTrader:
         while True:
             with self._open_conn() as conn:
                 cur = conn.cursor()
-                cur.execute("""
-                    SELECT rowid, symbol, direction, price
-                    FROM alerts
-                    WHERE rowid > ?
-                    ORDER BY rowid ASC
-                """, (self.last_alert_id,))
-                rows = cur.fetchall()
+                try:
+                    cur.execute("""
+                        SELECT rowid, symbol, direction, price
+                        FROM alerts
+                        WHERE rowid > ?
+                        ORDER BY rowid ASC
+                    """, (self.last_alert_id,))
+                    rows = cur.fetchall()
+                except sqlite3.OperationalError:
+                    # Table might not exist yet if grok.py is starting up
+                    time.sleep(1)
+                    continue
 
             for row in rows:
                 alert_id, symbol, direction, price = row

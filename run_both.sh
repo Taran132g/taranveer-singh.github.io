@@ -20,6 +20,8 @@ UI_LOG="$BASE_DIR/ui.log"
 # 0 = live mode, 1 = dry-run (safe)
 LIVE_DRY_RUN="${LIVE_DRY_RUN:-0}"
 
+export SYMBOLS="BBAI,F,AAL"
+
 cleanup() {
     echo -e "\n[STOP] Cleaning up..."
     for pid_var in GROK_PID PAPER_PID LIVE_PID UI_PID; do
@@ -36,7 +38,7 @@ trap 'cleanup' INT TERM EXIT
 
 echo "[RESET] Clearing previous data..."
 rm -f "$BASE_DIR"/*.log
-rm -f "$BASE_DIR/penny_basing.db"
+# rm -f "$BASE_DIR/penny_basing.db"  <-- Commented out to persist alerts/graph
 rm -f "$BASE_DIR/paper_trader_state.json"
 rm -f "$BASE_DIR/live_trader_state.json"
 rm -f "$BASE_DIR/daily_pnl.txt"

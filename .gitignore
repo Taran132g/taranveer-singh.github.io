@@ -5,3 +5,6 @@ schwab_tokens.json
 __pycache__/
 .venv/
 .DS_Store
+
+daily_pnl.txt
+*_state.json
